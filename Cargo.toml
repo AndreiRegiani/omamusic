@@ -1,0 +1,29 @@
+[package]
+name = "omamusic"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight music player for Omarchy, port of Overdrive"
+license = "MIT"
+
+[dependencies]
+gpui-kit = { version = "=0.7.1", default-features = false }
+gpui-omarchy = "=0.2.1"
+notify = "7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "6"
+anyhow = "1.0"
+parking_lot = "0.12"
+walkdir = "2.5"
+rand = "0.8"
+image = { version = "0.25", features = ["jpeg", "png", "bmp", "gif", "tiff", "webp"] }
+base64 = "0.22"
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
+rodio = { version = "0.22.2", default-features = false, features = ["symphonia-all"] }
+
+[profile.release]
+lto = "thin"
+opt-level = "z"
+strip = true
+codegen-units = 1
+panic = "abort"
