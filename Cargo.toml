@@ -19,6 +19,9 @@ rand = "0.8"
 image = { version = "0.25", features = ["jpeg", "png", "bmp", "gif", "tiff", "webp"] }
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 rodio = { version = "0.22.2", default-features = false, features = ["symphonia-all"] }
+mpris-server = "0.10.0"
+async-io = "2"
+async-channel = "2"
 
 [profile.release]
 lto = "thin"

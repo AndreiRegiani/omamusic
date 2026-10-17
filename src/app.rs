@@ -37,6 +37,7 @@ pub struct Omamusic {
     show_settings: bool,
     lib_version: u64,
     was_playing: bool,
+    last_track: Option<PathBuf>,
     seeking: bool,
     new_folder: Entity<InputState>,
 }
@@ -238,6 +239,7 @@ impl Omamusic {
             show_settings,
             lib_version: 0,
             was_playing: false,
+            last_track: None,
             seeking: false,
             new_folder,
         }
@@ -246,9 +248,12 @@ impl Omamusic {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let version = self.library.version();
         let playing = self.player.state() == PlayerState::Playing;
-        if version == self.lib_version && !playing && !self.was_playing {
+        let track = self.player.current().map(|t| t.path);
+        if version == self.lib_version && !playing && !self.was_playing && track == self.last_track
+        {
             return;
         }
+        self.last_track = track;
         if version != self.lib_version {
             self.clear_selection();
         }

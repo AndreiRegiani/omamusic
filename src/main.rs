@@ -1,13 +1,16 @@
 mod app;
 mod artwork;
 mod config;
+mod desktop;
 mod fuzzy;
 mod library;
 mod metadata;
 mod models;
+mod mpris;
 mod player;
 
 use app::Omamusic;
+use desktop::Command;
 use gpui_kit::{actions, px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
 use std::sync::Arc;
 
@@ -32,6 +35,9 @@ fn main() {
         dump_library();
         return;
     }
+    if desktop::raise_running() {
+        return;
+    }
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
@@ -47,7 +53,10 @@ fn main() {
             ]);
 
             let library = Arc::new(Library::new().expect("library"));
-            let player = Arc::new(Player::new(AppConfig::load().volume).expect("player"));
+            let config = AppConfig::load();
+            let player = Arc::new(Player::new(config.volume).expect("player"));
+            let (commands, received) = async_channel::unbounded();
+            desktop::start(player.clone(), library.clone(), commands);
 
             cx.on_action({
                 let player = player.clone();
@@ -78,24 +87,47 @@ fn main() {
                 }
             });
 
-            cx.open_window(
-                WindowOptions {
-                    titlebar: None,
-                    window_min_size: Some(size(px(560.), px(420.))),
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        size(px(1020.), px(680.)),
-                        cx,
-                    ))),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    cx.new(|cx| Omamusic::new(library.clone(), player.clone(), window, cx))
-                },
-            )
-            .expect("open omamusic");
+            cx.spawn({
+                let library = library.clone();
+                let player = player.clone();
+                async move |cx| {
+                    while let Ok(command) = received.recv().await {
+                        cx.update(|cx| match command {
+                            Command::Quit => cx.quit(),
+                            Command::ShowWindow => show_window(&library, &player, cx),
+                        });
+                    }
+                }
+            })
+            .detach();
+
+            show_window(&library, &player, cx);
             cx.activate(true);
         });
+}
+
+fn show_window(library: &Arc<Library>, player: &Arc<Player>, cx: &mut App) {
+    if let Some(window) = cx.windows().first() {
+        let _ = window.update(cx, |_, window, _| window.activate_window());
+        return;
+    }
+    let (library, player) = (library.clone(), player.clone());
+    let opened = cx.open_window(
+        WindowOptions {
+            titlebar: None,
+            window_min_size: Some(size(px(560.), px(420.))),
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(1020.), px(680.)),
+                cx,
+            ))),
+            ..Default::default()
+        },
+        |window, cx| cx.new(|cx| Omamusic::new(library, player, window, cx)),
+    );
+    if let Err(err) = opened {
+        eprintln!("open window: {err:#}");
+    }
 }
 
 fn dump_library() {
