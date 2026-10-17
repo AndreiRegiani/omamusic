@@ -29,6 +29,7 @@ pub struct Omamusic {
     volume: Entity<SliderState>,
     progress_state: Entity<SliderState>,
     selected_album: Option<String>,
+    selected_artist: Option<String>,
     show_settings: bool,
     lib_version: u64,
     was_playing: bool,
@@ -83,6 +84,7 @@ impl Omamusic {
             let text = state.read(cx).text().to_string();
             this.library.set_query(text);
             this.selected_album = None;
+            this.selected_artist = None;
             cx.notify();
         })
         .detach();
@@ -143,6 +145,7 @@ impl Omamusic {
             volume,
             progress_state,
             selected_album,
+            selected_artist: None,
             show_settings,
             lib_version: 0,
             was_playing: false,
@@ -353,6 +356,7 @@ impl Render for Omamusic {
                                             cx.listener(move |this, _, _, cx| {
                                                 this.section = section;
                                                 this.selected_album = None;
+                                                this.selected_artist = None;
                                                 cx.notify();
                                             }),
                                         )
@@ -424,14 +428,61 @@ impl Omamusic {
         {
             return self.render_album_detail(album, cx);
         }
+        if let Some(name) = self.selected_artist.clone() {
+            return self.render_artist_albums(&name, snap, cx);
+        }
         match self.section {
-            Section::Albums => self.render_album_grid(snap, cx),
+            Section::Albums => self.render_album_grid(&snap.filtered_albums, cx),
             Section::Artists => self.render_artist_list(snap, cx),
             Section::Songs => self.render_song_list(snap, cx),
         }
     }
 
-    fn render_album_grid(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
+    fn render_artist_albums(
+        &mut self,
+        name: &str,
+        snap: &LibrarySnapshot,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.omarchy().clone();
+        let albums: Vec<Album> = snap
+            .albums
+            .iter()
+            .filter(|a| a.artist == name)
+            .cloned()
+            .collect();
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(rems(0.75))
+                    .px(rems(0.75))
+                    .pt(rems(0.75))
+                    .child(
+                        button("artist-back", "Back", ButtonVariant::Secondary, cx).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.selected_artist = None;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(1.125))
+                            .text_color(theme.foreground)
+                            .child(name.to_string()),
+                    ),
+            )
+            .child(self.render_album_grid(&albums, cx))
+            .into_any_element()
+    }
+
+    fn render_album_grid(&mut self, albums: &[Album], cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.omarchy().clone();
         div()
             .id("albums-scroll")
@@ -439,55 +490,49 @@ impl Omamusic {
             .min_h_0()
             .overflow_y_scroll()
             .p(rems(0.75))
-            .child(
-                div().flex().flex_wrap().gap(rems(0.75)).children(
-                    snap.filtered_albums
-                        .iter()
-                        .take(400)
-                        .enumerate()
-                        .map(|(idx, a)| {
-                            let id = a.id.clone();
-                            let n = a.tracks.len();
-                            let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
+            .child(div().flex().flex_wrap().gap(rems(0.75)).children(
+                albums.iter().take(400).enumerate().map(|(idx, a)| {
+                    let id = a.id.clone();
+                    let n = a.tracks.len();
+                    let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
+                    div()
+                        .id(("album", idx))
+                        .w(rems(10.))
+                        .min_w(rems(8.))
+                        .flex()
+                        .flex_col()
+                        .gap(rems(0.375))
+                        .p(rems(0.5))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .hover(|s| s.bg(theme.hover_fill()))
+                        .cursor_pointer()
+                        .child(self.cover(Some(&a.id), 128., &a.title, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected_album = Some(id.clone());
+                            cx.notify();
+                        }))
+                        .child(
                             div()
-                                .id(("album", idx))
-                                .w(rems(10.))
-                                .min_w(rems(8.))
-                                .flex()
-                                .flex_col()
-                                .gap(rems(0.375))
-                                .p(rems(0.5))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.background)
-                                .hover(|s| s.bg(theme.hover_fill()))
-                                .cursor_pointer()
-                                .child(self.cover(Some(&a.id), 128., &a.title, cx))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected_album = Some(id.clone());
-                                    cx.notify();
-                                }))
-                                .child(
-                                    div()
-                                        .text_size(rems(0.75))
-                                        .text_color(theme.foreground)
-                                        .child(a.title.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(rems(0.6875))
-                                        .text_color(theme.secondary)
-                                        .child(a.artist.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(rems(0.6875))
-                                        .text_color(theme.secondary)
-                                        .child(count),
-                                )
-                        }),
-                ),
-            )
+                                .text_size(rems(0.75))
+                                .text_color(theme.foreground)
+                                .child(a.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(rems(0.6875))
+                                .text_color(theme.secondary)
+                                .child(a.artist.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(rems(0.6875))
+                                .text_color(theme.secondary)
+                                .child(count),
+                        )
+                }),
+            ))
             .into_any_element()
     }
 
@@ -531,11 +576,8 @@ impl Omamusic {
                                         name,
                                         cx,
                                     ))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.section = Section::Albums;
-                                        this.query.update(cx, |q, cx| {
-                                            q.set_value(aname.as_str(), window, cx)
-                                        });
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.selected_artist = Some(aname.clone());
                                         cx.notify();
                                     }))
                                     .child(
