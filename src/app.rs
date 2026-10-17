@@ -14,6 +14,7 @@ use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, panel,
     separator, slider, with_tooltip, ActiveTheme, ButtonVariant, IconName,
 };
+use rand::Rng;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -616,16 +617,32 @@ impl Omamusic {
     fn render_album_detail(&mut self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.omarchy().clone();
         let total = album.tracks.iter().map(|t| t.duration).sum::<f64>();
-        let subtitle = format!(
-            "{} · {} songs · {}",
-            album.artist,
-            album.tracks.len(),
-            format_time(total)
-        );
+        let n = album.tracks.len();
+        let subtitle = [
+            album.artist.clone(),
+            if album.year > 0 {
+                album.year.to_string()
+            } else {
+                String::new()
+            },
+            format!("{n} song{}", if n == 1 { "" } else { "s" }),
+            format_time(total),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let current = self.player.current();
+        let playing = self.player.state() == PlayerState::Playing;
         let play = |shuffle: bool, tracks: Arc<[Track]>| {
             move |this: &mut Omamusic, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                let start = if shuffle {
+                    rand::thread_rng().gen_range(0..tracks.len())
+                } else {
+                    0
+                };
                 this.player.set_shuffle(shuffle);
-                this.player.play(tracks.to_vec(), 0);
+                this.player.play(tracks.to_vec(), start);
                 cx.notify();
             }
         };
@@ -710,6 +727,21 @@ impl Omamusic {
                             .flex_col()
                             .children(album.tracks.iter().enumerate().map(|(i, t)| {
                                 let all = album.tracks.clone();
+                                let is_current = current.as_ref().is_some_and(|c| c.path == t.path);
+                                let number = if is_current {
+                                    icon(if playing {
+                                        IconName::Volume2
+                                    } else {
+                                        IconName::Volume
+                                    })
+                                    .size(rems(0.875))
+                                    .text_color(theme.accent)
+                                    .into_any_element()
+                                } else if t.track_number > 0 {
+                                    t.track_number.to_string().into_any_element()
+                                } else {
+                                    "".into_any_element()
+                                };
                                 div()
                                     .id(("album-track", i))
                                     .flex()
@@ -726,14 +758,25 @@ impl Omamusic {
                                     .child(
                                         div()
                                             .w(rems(2.))
+                                            .flex()
+                                            .justify_end()
                                             .text_color(theme.secondary)
-                                            .child(format!("{}", t.track_number)),
+                                            .child(number),
                                     )
                                     .child(
                                         div()
                                             .flex_1()
+                                            .flex()
+                                            .gap(rems(0.5))
                                             .text_color(theme.foreground)
-                                            .child(t.title.clone()),
+                                            .child(t.title.clone())
+                                            .when(t.artist != album.artist, |d| {
+                                                d.child(
+                                                    div()
+                                                        .text_color(theme.secondary)
+                                                        .child(t.artist.clone()),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()
