@@ -17,6 +17,7 @@ use gpui_omarchy::{
     separator, slider, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName, MenuItem,
 };
 use rand::Rng;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +32,8 @@ pub struct Omamusic {
     volume: Entity<SliderState>,
     progress_state: Entity<SliderState>,
     pages: Vec<Page>,
+    selection: BTreeSet<usize>,
+    anchor: Option<usize>,
     show_settings: bool,
     lib_version: u64,
     was_playing: bool,
@@ -164,6 +167,7 @@ impl Omamusic {
             let text = state.read(cx).text().to_string();
             this.library.set_query(text);
             this.pages.clear();
+            this.clear_selection();
             cx.notify();
         })
         .detach();
@@ -229,6 +233,8 @@ impl Omamusic {
             volume,
             progress_state,
             pages,
+            selection: BTreeSet::new(),
+            anchor: None,
             show_settings,
             lib_version: 0,
             was_playing: false,
@@ -242,6 +248,9 @@ impl Omamusic {
         let playing = self.player.state() == PlayerState::Playing;
         if version == self.lib_version && !playing && !self.was_playing {
             return;
+        }
+        if version != self.lib_version {
+            self.clear_selection();
         }
         self.lib_version = version;
         self.was_playing = playing;
@@ -284,18 +293,50 @@ impl Omamusic {
         if self.pages.last() != Some(&page) {
             self.pages.push(page);
         }
+        self.clear_selection();
         cx.notify();
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
         self.pages.pop();
+        self.clear_selection();
         cx.notify();
     }
 
     fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
         self.section = section;
         self.pages.clear();
+        self.clear_selection();
         cx.notify();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.anchor = None;
+    }
+
+    fn select_row(&mut self, row: usize, event: &ClickEvent) -> bool {
+        let m = event.modifiers();
+        let toggle = m.control || m.platform;
+        match self.anchor {
+            Some(anchor) if m.shift => {
+                if !toggle {
+                    self.selection.clear();
+                }
+                self.selection.extend(anchor.min(row)..=anchor.max(row));
+                return false;
+            }
+            _ if toggle => {
+                if !self.selection.remove(&row) {
+                    self.selection.insert(row);
+                }
+            }
+            _ => {
+                self.selection = BTreeSet::from([row]);
+            }
+        }
+        self.anchor = Some(row);
+        event.click_count() >= 2 && !toggle
     }
 
     fn track_action(
@@ -306,17 +347,27 @@ impl Omamusic {
         queue: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(track) = list.get(row).cloned() else {
+        let rows: Vec<usize> = if self.selection.contains(&row) {
+            self.selection.iter().copied().collect()
+        } else {
+            vec![row]
+        };
+        let tracks: Vec<Track> = rows.iter().filter_map(|&i| list.get(i).cloned()).collect();
+        let Some(first) = tracks.first().cloned() else {
             return;
         };
         match action {
             RowAction::Play if queue => self.player.jump(row),
+            RowAction::Play if tracks.len() > 1 => self.player.play(tracks, 0),
             RowAction::Play => self.player.play(list.to_vec(), row),
-            RowAction::PlayNext => self.player.play_next(vec![track]),
-            RowAction::AddToQueue => self.player.enqueue(vec![track]),
-            RowAction::GoToAlbum => self.navigate(Page::Album(track.album_id), cx),
-            RowAction::GoToArtist => self.navigate(Page::Artist(track.artist), cx),
-            RowAction::Remove => self.player.remove(&[row]),
+            RowAction::PlayNext => self.player.play_next(tracks),
+            RowAction::AddToQueue => self.player.enqueue(tracks),
+            RowAction::GoToAlbum => self.navigate(Page::Album(first.album_id), cx),
+            RowAction::GoToArtist => self.navigate(Page::Artist(first.artist), cx),
+            RowAction::Remove => {
+                self.player.remove(&rows);
+                self.clear_selection();
+            }
         }
         cx.notify();
     }
@@ -371,10 +422,28 @@ impl Omamusic {
         content: Stateful<Div>,
         cx: &mut Context<Self>,
     ) -> Popover {
+        let theme = cx.omarchy().clone();
         let click_list = list.clone();
-        let content = content.on_click(cx.listener(move |this, _, _, cx| {
-            this.track_action(RowAction::Play, &click_list, row, queue, cx)
-        }));
+        let content = content
+            .when(self.selection.contains(&row), |d| {
+                d.bg(theme.selected_fill())
+            })
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if this.select_row(row, event) {
+                    this.track_action(RowAction::Play, &click_list, row, queue, cx);
+                }
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    if !this.selection.contains(&row) {
+                        this.selection = BTreeSet::from([row]);
+                        this.anchor = Some(row);
+                        cx.notify();
+                    }
+                }),
+            );
         let actions = if queue { QUEUE_ACTIONS } else { TRACK_ACTIONS };
         Self::context_menu(
             (id, row),
@@ -1110,6 +1179,7 @@ impl Omamusic {
                         button("clear-queue", "Clear", ButtonVariant::Secondary, cx).on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.player.stop();
+                                this.clear_selection();
                                 cx.notify();
                             }),
                         ),
