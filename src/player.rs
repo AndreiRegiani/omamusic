@@ -94,6 +94,41 @@ fn select(playback: &mut Playback, index: usize) -> Option<Track> {
     Some(track)
 }
 
+fn insert(playback: &mut Playback, tracks: Vec<Track>, next: bool) {
+    let (at, order_at) = if next {
+        let current = playback.current.as_ref().map(|c| c.path.clone());
+        let order_at = playback
+            .order
+            .iter()
+            .position(|t| Some(&t.path) == current.as_ref())
+            .map_or(playback.order.len(), |i| i + 1);
+        (playback.index + 1, order_at)
+    } else {
+        (playback.queue.len(), playback.order.len())
+    };
+    let at = at.min(playback.queue.len());
+    playback.queue.splice(at..at, tracks.iter().cloned());
+    playback.order.splice(order_at..order_at, tracks);
+}
+
+fn remove(playback: &mut Playback, indices: &[usize]) {
+    let mut indices = indices.to_vec();
+    indices.sort_unstable_by(|a, b| b.cmp(a));
+    indices.dedup();
+    for i in indices {
+        if i == playback.index || i >= playback.queue.len() {
+            continue;
+        }
+        let track = playback.queue.remove(i);
+        if i < playback.index {
+            playback.index -= 1;
+        }
+        if let Some(pos) = playback.order.iter().position(|t| t.path == track.path) {
+            playback.order.remove(pos);
+        }
+    }
+}
+
 fn stop(playback: &mut Playback) {
     playback.state = PlayerState::Stopped;
     playback.current = None;
@@ -363,6 +398,41 @@ impl Player {
         self.load(track);
     }
 
+    pub fn play_next(&self, tracks: Vec<Track>) {
+        self.insert(tracks, true);
+    }
+
+    pub fn enqueue(&self, tracks: Vec<Track>) {
+        self.insert(tracks, false);
+    }
+
+    fn insert(&self, tracks: Vec<Track>, next: bool) {
+        if tracks.is_empty() {
+            return;
+        }
+        let mut p = self.shared.playback.lock();
+        if p.current.is_none() {
+            drop(p);
+            self.play(tracks, 0);
+            return;
+        }
+        insert(&mut p, tracks, next);
+    }
+
+    pub fn remove(&self, indices: &[usize]) {
+        remove(&mut self.shared.playback.lock(), indices);
+    }
+
+    pub fn jump(&self, index: usize) {
+        let track = select(&mut self.shared.playback.lock(), index);
+        self.load(track);
+    }
+
+    pub fn queue(&self) -> (Vec<Track>, Option<usize>) {
+        let p = self.shared.playback.lock();
+        (p.queue.clone(), p.current.is_some().then_some(p.index))
+    }
+
     fn load(&self, track: Option<Track>) -> bool {
         let Some(track) = track else {
             return false;
@@ -537,6 +607,48 @@ mod tests {
             duration: 0.0,
             album_id: String::new(),
         }
+    }
+
+    fn named(name: &str) -> Track {
+        track(std::path::PathBuf::from(name))
+    }
+
+    fn names(tracks: &[Track]) -> Vec<String> {
+        tracks
+            .iter()
+            .map(|t| t.path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn playing(queue: &[&str], order: &[&str], index: usize) -> Playback {
+        let queue: Vec<Track> = queue.iter().map(|n| named(n)).collect();
+        Playback {
+            current: queue.get(index).cloned(),
+            order: order.iter().map(|n| named(n)).collect(),
+            queue,
+            index,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn play_next_inserts_after_current_in_queue_and_order() {
+        let mut p = playing(&["c", "a", "b"], &["a", "b", "c"], 0);
+        insert(&mut p, vec![named("x"), named("y")], true);
+        assert_eq!(names(&p.queue), ["c", "x", "y", "a", "b"]);
+        assert_eq!(names(&p.order), ["a", "b", "c", "x", "y"]);
+        insert(&mut p, vec![named("z")], false);
+        assert_eq!(names(&p.queue), ["c", "x", "y", "a", "b", "z"]);
+        assert_eq!(names(&p.order), ["a", "b", "c", "x", "y", "z"]);
+    }
+
+    #[test]
+    fn remove_keeps_current_and_shifts_index() {
+        let mut p = playing(&["a", "b", "c", "d"], &["a", "b", "c", "d"], 2);
+        remove(&mut p, &[0, 2, 3]);
+        assert_eq!(names(&p.queue), ["b", "c"]);
+        assert_eq!(names(&p.order), ["b", "c"]);
+        assert_eq!(p.index, 1);
     }
 
     fn wait_for(mut condition: impl FnMut() -> bool) -> bool {

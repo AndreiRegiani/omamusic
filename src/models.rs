@@ -28,6 +28,7 @@ pub enum Section {
     Albums,
     Artists,
     Songs,
+    Queue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

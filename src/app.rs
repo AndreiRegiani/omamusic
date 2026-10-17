@@ -5,15 +5,16 @@ use crate::player::Player;
 use crate::{FocusSearch, GoBack};
 use gpui_kit::base::input::InputState;
 use gpui_kit::base::slider::{SliderEvent, SliderState};
+use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, rems, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity,
+    div, px, rems, AnyElement, App, AppContext, ClickEvent, Context, Div, ElementId, Entity,
     ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
-    PathPromptOptions, Render, StatefulInteractiveElement, Styled, Window,
+    PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_omarchy::{
-    avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, panel,
-    separator, slider, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName,
+    avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
+    separator, slider, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName, MenuItem,
 };
 use rand::Rng;
 use std::path::PathBuf;
@@ -41,6 +42,79 @@ pub struct Omamusic {
 enum Page {
     Album(String),
     Artist(String),
+}
+
+#[derive(Clone, Copy)]
+enum RowAction {
+    Play,
+    PlayNext,
+    AddToQueue,
+    GoToAlbum,
+    GoToArtist,
+    Remove,
+}
+
+const TRACK_ACTIONS: &[RowAction] = &[
+    RowAction::Play,
+    RowAction::PlayNext,
+    RowAction::AddToQueue,
+    RowAction::GoToAlbum,
+    RowAction::GoToArtist,
+];
+const QUEUE_ACTIONS: &[RowAction] = &[
+    RowAction::Play,
+    RowAction::GoToAlbum,
+    RowAction::GoToArtist,
+    RowAction::Remove,
+];
+const ALBUM_ACTIONS: &[RowAction] = &[
+    RowAction::Play,
+    RowAction::PlayNext,
+    RowAction::AddToQueue,
+    RowAction::GoToArtist,
+];
+const ARTIST_ACTIONS: &[RowAction] = &[RowAction::Play, RowAction::PlayNext, RowAction::AddToQueue];
+
+impl RowAction {
+    fn group(self) -> u8 {
+        match self {
+            RowAction::Play | RowAction::PlayNext | RowAction::AddToQueue => 0,
+            RowAction::GoToAlbum | RowAction::GoToArtist => 1,
+            RowAction::Remove => 2,
+        }
+    }
+
+    fn item(self) -> MenuItem {
+        let (label, icon_name) = match self {
+            RowAction::Play => ("Play", IconName::Play),
+            RowAction::PlayNext => ("Play Next", IconName::ListStart),
+            RowAction::AddToQueue => ("Add to Queue", IconName::ListEnd),
+            RowAction::GoToAlbum => ("Go to Album", IconName::Disc3),
+            RowAction::GoToArtist => ("Go to Artist", IconName::Mic),
+            RowAction::Remove => ("Remove from Queue", IconName::ListX),
+        };
+        MenuItem::new(label).icon(icon_name)
+    }
+}
+
+struct MenuTrigger(AnyElement);
+
+impl IntoElement for MenuTrigger {
+    type Element = AnyElement;
+
+    fn into_element(self) -> AnyElement {
+        self.0
+    }
+}
+
+impl Selectable for MenuTrigger {
+    fn selected(self, _: bool) -> Self {
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        false
+    }
 }
 
 fn initials(text: &str) -> String {
@@ -134,6 +208,7 @@ impl Omamusic {
         let (section, pages, show_settings) = match view.as_deref() {
             Some("artists") => (Section::Artists, Vec::new(), false),
             Some("songs") => (Section::Songs, Vec::new(), false),
+            Some("queue") => (Section::Queue, Vec::new(), false),
             Some("settings") => (Section::Albums, Vec::new(), true),
             Some("album") => {
                 let first = library.snapshot().albums.first().map(|a| a.id.clone());
@@ -223,6 +298,94 @@ impl Omamusic {
         cx.notify();
     }
 
+    fn track_action(
+        &mut self,
+        action: RowAction,
+        list: &[Track],
+        row: usize,
+        queue: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(track) = list.get(row).cloned() else {
+            return;
+        };
+        match action {
+            RowAction::Play if queue => self.player.jump(row),
+            RowAction::Play => self.player.play(list.to_vec(), row),
+            RowAction::PlayNext => self.player.play_next(vec![track]),
+            RowAction::AddToQueue => self.player.enqueue(vec![track]),
+            RowAction::GoToAlbum => self.navigate(Page::Album(track.album_id), cx),
+            RowAction::GoToArtist => self.navigate(Page::Artist(track.artist), cx),
+            RowAction::Remove => self.player.remove(&[row]),
+        }
+        cx.notify();
+    }
+
+    fn tracks_action(&mut self, action: RowAction, tracks: &[Track], cx: &mut Context<Self>) {
+        match action {
+            RowAction::Play => self.player.play(tracks.to_vec(), 0),
+            RowAction::PlayNext => self.player.play_next(tracks.to_vec()),
+            RowAction::AddToQueue => self.player.enqueue(tracks.to_vec()),
+            RowAction::GoToAlbum | RowAction::GoToArtist | RowAction::Remove => {}
+        }
+        cx.notify();
+    }
+
+    fn context_menu(
+        id: impl Into<ElementId>,
+        trigger: impl IntoElement,
+        actions: &'static [RowAction],
+        on_select: impl Fn(&mut Self, RowAction, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let this = cx.entity().downgrade();
+        let items = actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let item = action.item();
+                if i > 0 && actions[i - 1].group() != action.group() {
+                    item.separator_before()
+                } else {
+                    item
+                }
+            })
+            .collect();
+        menu(
+            id,
+            MenuTrigger(trigger.into_any_element()),
+            items,
+            move |index, _, cx| {
+                let _ = this.update(cx, |this, cx| on_select(this, actions[index], cx));
+            },
+        )
+        .mouse_button(MouseButton::Right)
+    }
+
+    fn track_row(
+        &self,
+        id: &'static str,
+        row: usize,
+        list: Arc<[Track]>,
+        queue: bool,
+        content: Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let click_list = list.clone();
+        let content = content.on_click(cx.listener(move |this, _, _, cx| {
+            this.track_action(RowAction::Play, &click_list, row, queue, cx)
+        }));
+        let actions = if queue { QUEUE_ACTIONS } else { TRACK_ACTIONS };
+        Self::context_menu(
+            (id, row),
+            content,
+            actions,
+            move |this, action, cx| this.track_action(action, &list, row, queue, cx),
+            cx,
+        )
+        .w_full()
+    }
+
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.query.update(cx, |q, cx| {
             q.set_value("", window, cx);
@@ -299,6 +462,7 @@ impl Render for Omamusic {
             ("nav-albums", "Albums", IconName::Disc3, Section::Albums),
             ("nav-artists", "Artists", IconName::Mic, Section::Artists),
             ("nav-songs", "Songs", IconName::Music, Section::Songs),
+            ("nav-queue", "Up Next", IconName::ListMusic, Section::Queue),
         ];
 
         focus_scope("omamusic")
@@ -423,26 +587,36 @@ impl Render for Omamusic {
                                     .flex()
                                     .flex_col()
                                     .bg(theme.background)
-                                    .child(if snap.folders.is_empty() {
-                                        empty_state("No Music", "Add a folder with music.", cx)
-                                            .child(
-                                                button(
-                                                    "empty-add-folder",
-                                                    "Add Folder…",
-                                                    ButtonVariant::Primary,
-                                                    cx,
+                                    .child(
+                                        if snap.folders.is_empty() && self.section != Section::Queue
+                                        {
+                                            empty_state("No Music", "Add a folder with music.", cx)
+                                                .child(
+                                                    button(
+                                                        "empty-add-folder",
+                                                        "Add Folder…",
+                                                        ButtonVariant::Primary,
+                                                        cx,
+                                                    )
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.browse_folder(cx)
+                                                    })),
                                                 )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.browse_folder(cx)
-                                                })),
+                                                .into_any_element()
+                                        } else if snap.albums.is_empty()
+                                            && snap.scanning
+                                            && self.section != Section::Queue
+                                        {
+                                            empty_state(
+                                                "Scanning…",
+                                                "Reading the music folders.",
+                                                cx,
                                             )
                                             .into_any_element()
-                                    } else if snap.albums.is_empty() && snap.scanning {
-                                        empty_state("Scanning…", "Reading the music folders.", cx)
-                                            .into_any_element()
-                                    } else {
-                                        self.render_content(&snap, cx)
-                                    }),
+                                        } else {
+                                            self.render_content(&snap, cx)
+                                        },
+                                    ),
                             ),
                     )
                     .child(separator(cx))
@@ -469,6 +643,7 @@ impl Omamusic {
             Section::Albums => self.render_album_grid(&snap.filtered_albums, cx),
             Section::Artists => self.render_artist_list(snap, cx),
             Section::Songs => self.render_song_list(snap, cx),
+            Section::Queue => self.render_queue(cx),
         }
     }
 
@@ -523,9 +698,11 @@ impl Omamusic {
             .child(div().flex().flex_wrap().gap(rems(0.75)).children(
                 albums.iter().take(400).enumerate().map(|(idx, a)| {
                     let id = a.id.clone();
+                    let tracks = a.tracks.clone();
                     let n = a.tracks.len();
                     let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
-                    div()
+                    let artist = a.artist.clone();
+                    let card = div()
                         .id(("album", idx))
                         .w(rems(10.))
                         .min_w(rems(8.))
@@ -559,7 +736,19 @@ impl Omamusic {
                                 .text_size(rems(0.6875))
                                 .text_color(theme.secondary)
                                 .child(count),
-                        )
+                        );
+                    Self::context_menu(
+                        ("album-menu", idx),
+                        card,
+                        ALBUM_ACTIONS,
+                        move |this, action, cx| match action {
+                            RowAction::GoToArtist => {
+                                this.navigate(Page::Artist(artist.clone()), cx)
+                            }
+                            _ => this.tracks_action(action, &tracks, cx),
+                        },
+                        cx,
+                    )
                 }),
             ))
             .into_any_element()
@@ -588,7 +777,11 @@ impl Omamusic {
                                     if an == 1 { "" } else { "s" }
                                 );
                                 let aname = name.clone();
-                                div()
+                                let tracks: Vec<Track> = albums
+                                    .iter()
+                                    .flat_map(|a| a.tracks.iter().cloned())
+                                    .collect();
+                                let row = div()
                                     .id(("artist", idx))
                                     .flex()
                                     .items_center()
@@ -613,7 +806,15 @@ impl Omamusic {
                                             .text_size(rems(0.75))
                                             .text_color(theme.foreground)
                                             .child(label),
-                                    )
+                                    );
+                                Self::context_menu(
+                                    ("artist-menu", idx),
+                                    row,
+                                    ARTIST_ACTIONS,
+                                    move |this, action, cx| this.tracks_action(action, &tracks, cx),
+                                    cx,
+                                )
+                                .w_full()
                             }),
                     ),
             )
@@ -633,13 +834,12 @@ impl Omamusic {
                     .flex()
                     .flex_col()
                     .children(tracks.iter().take(800).enumerate().map(|(i, t)| {
-                        let all = tracks.clone();
                         let bg = if i % 2 == 0 {
                             theme.background
                         } else {
                             theme.hover_fill()
                         };
-                        div()
+                        let row = div()
                             .id(("song", i))
                             .flex()
                             .items_center()
@@ -649,10 +849,6 @@ impl Omamusic {
                             .bg(bg)
                             .hover(|s| s.bg(theme.hover_fill()))
                             .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.player.play(all.to_vec(), i);
-                                cx.notify();
-                            }))
                             .child(
                                 div()
                                     .w(rems(2.))
@@ -688,7 +884,8 @@ impl Omamusic {
                                     .text_size(rems(0.6875))
                                     .text_color(theme.secondary)
                                     .child(format_time(t.duration)),
-                            )
+                            );
+                        self.track_row("song", i, tracks.clone(), false, row, cx)
                     })),
             )
             .into_any_element()
@@ -805,7 +1002,6 @@ impl Omamusic {
                             .flex()
                             .flex_col()
                             .children(album.tracks.iter().enumerate().map(|(i, t)| {
-                                let all = album.tracks.clone();
                                 let is_current = current.as_ref().is_some_and(|c| c.path == t.path);
                                 let number = if is_current {
                                     icon(if playing {
@@ -821,7 +1017,7 @@ impl Omamusic {
                                 } else {
                                     "".into_any_element()
                                 };
-                                div()
+                                let row = div()
                                     .id(("album-track", i))
                                     .flex()
                                     .items_center()
@@ -830,10 +1026,6 @@ impl Omamusic {
                                     .py(rems(0.375))
                                     .hover(|s| s.bg(theme.hover_fill()))
                                     .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.player.play(all.to_vec(), i);
-                                        cx.notify();
-                                    }))
                                     .child(
                                         div()
                                             .w(rems(2.))
@@ -861,7 +1053,131 @@ impl Omamusic {
                                         div()
                                             .text_color(theme.secondary)
                                             .child(format_time(t.duration)),
+                                    );
+                                self.track_row(
+                                    "album-track-menu",
+                                    i,
+                                    album.tracks.clone(),
+                                    false,
+                                    row,
+                                    cx,
+                                )
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_queue(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.omarchy().clone();
+        let (queue, index) = self.player.queue();
+        if queue.is_empty() {
+            return empty_state(
+                "Queue Empty",
+                "Play something or add songs to the queue.",
+                cx,
+            )
+            .into_any_element();
+        }
+        let playing = self.player.state() == PlayerState::Playing;
+        let queue: Arc<[Track]> = queue.into();
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(rems(0.75))
+                    .px(rems(0.75))
+                    .py(rems(0.5))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(rems(0.75))
+                            .text_color(theme.secondary)
+                            .child(format!(
+                                "{} songs · {}",
+                                queue.len(),
+                                format_time(queue.iter().map(|t| t.duration).sum())
+                            )),
+                    )
+                    .child(
+                        button("clear-queue", "Clear", ButtonVariant::Secondary, cx).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.player.stop();
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("queue-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .children(queue.iter().enumerate().map(|(i, t)| {
+                                let is_current = index == Some(i);
+                                let past = index.is_some_and(|current| i < current);
+                                let number = if is_current {
+                                    icon(if playing {
+                                        IconName::Volume2
+                                    } else {
+                                        IconName::Volume
+                                    })
+                                    .size(rems(0.875))
+                                    .text_color(theme.accent)
+                                    .into_any_element()
+                                } else {
+                                    (i + 1).to_string().into_any_element()
+                                };
+                                let row = div()
+                                    .id(("queue-row", i))
+                                    .flex()
+                                    .items_center()
+                                    .gap(rems(0.75))
+                                    .px(rems(0.75))
+                                    .py(rems(0.375))
+                                    .text_size(rems(0.75))
+                                    .text_color(if past {
+                                        theme.secondary
+                                    } else {
+                                        theme.foreground
+                                    })
+                                    .hover(|s| s.bg(theme.hover_fill()))
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .w(rems(2.))
+                                            .flex()
+                                            .justify_end()
+                                            .text_color(theme.secondary)
+                                            .child(number),
                                     )
+                                    .child(self.cover(Some(&t.album_id), 28., &t.album, cx))
+                                    .child(div().flex_1().min_w_0().child(t.title.clone()))
+                                    .child(
+                                        div()
+                                            .w(rems(10.))
+                                            .text_color(theme.secondary)
+                                            .child(t.artist.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(rems(3.))
+                                            .text_color(theme.secondary)
+                                            .child(format_time(t.duration)),
+                                    );
+                                self.track_row("queue-menu", i, queue.clone(), true, row, cx)
                             })),
                     ),
             )
