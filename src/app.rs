@@ -6,13 +6,13 @@ use gpui_kit::base::input::InputState;
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, img, px, rems, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity,
+    div, px, rems, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity,
     ImageSource, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Render,
     StatefulInteractiveElement, Styled, Window,
 };
 use gpui_omarchy::{
-    avatar, button, empty_state, focus_scope, icon, icon_button, input, panel, separator, slider,
-    with_tooltip, ActiveTheme, ButtonVariant, IconName,
+    avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, panel,
+    separator, slider, with_tooltip, ActiveTheme, ButtonVariant, IconName,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -168,10 +168,11 @@ impl Omamusic {
         cx.notify();
     }
 
-    fn cover(&self, album_id: Option<&str>, size: u32, name: &str, cx: &App) -> AnyElement {
-        match album_id.and_then(|id| self.library.covers().thumbnail(id, size)) {
-            Some(image) => img(ImageSource::Image(image)).into_any_element(),
-            None => avatar(initials(name), cx).into_any_element(),
+    fn cover(&self, album_id: Option<&str>, size: f32, name: &str, cx: &App) -> impl IntoElement {
+        let cover = avatar(initials(name), cx).size(px(size));
+        match album_id.and_then(|id| self.library.covers().thumbnail(id, size as u32 * 2)) {
+            Some(image) => cover.image(avatar_image(ImageSource::Image(image))),
+            None => cover,
         }
     }
 
@@ -450,7 +451,7 @@ impl Omamusic {
                                 .bg(theme.background)
                                 .hover(|s| s.bg(theme.hover_fill()))
                                 .cursor_pointer()
-                                .child(self.cover(Some(&a.id), 120, &a.title, cx))
+                                .child(self.cover(Some(&a.id), 128., &a.title, cx))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.selected_album = Some(id.clone());
                                     cx.notify();
@@ -515,7 +516,7 @@ impl Omamusic {
                                     .cursor_pointer()
                                     .child(self.cover(
                                         albums.first().map(|a| a.id.as_str()),
-                                        40,
+                                        40.,
                                         name,
                                         cx,
                                     ))
@@ -644,7 +645,7 @@ impl Omamusic {
                             .flex()
                             .items_end()
                             .gap(rems(1.))
-                            .child(avatar(initials(&album.title), cx))
+                            .child(self.cover(Some(&album.id), 176., &album.title, cx))
                             .child(
                                 div()
                                     .flex()
@@ -790,10 +791,10 @@ impl Omamusic {
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.background)
-            .child(avatar(
-                current
-                    .map(|t| initials(&t.title))
-                    .unwrap_or_else(|| "♪".into()),
+            .child(self.cover(
+                current.map(|t| t.album_id.as_str()),
+                40.,
+                current.map_or("♪", |t| t.title.as_str()),
                 cx,
             ))
             .child(
