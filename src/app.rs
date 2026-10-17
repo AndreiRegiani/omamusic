@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, panel,
-    separator, slider, with_tooltip, ActiveTheme, ButtonVariant, IconName,
+    separator, slider, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName,
 };
 use rand::Rng;
 use std::path::PathBuf;
@@ -185,19 +185,23 @@ impl Omamusic {
         icon_name: IconName,
         label: &'static str,
         variant: ButtonVariant,
-        tooltip: &'static str,
+        disabled: bool,
         action: fn(&Player),
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        with_tooltip(
-            icon_button(id, icon_name, label, variant, cx).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    action(&this.player);
-                    cx.notify();
-                },
-            )),
-            tooltip,
-        )
+    ) -> Button {
+        icon_button(id, icon_name, label, variant, cx)
+            .disabled(disabled)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                action(&this.player);
+                cx.notify();
+            }))
+    }
+
+    fn open_album(&mut self, album_id: String, cx: &mut Context<Self>) {
+        self.section = Section::Albums;
+        self.selected_artist = None;
+        self.selected_album = Some(album_id);
+        cx.notify();
     }
 
     fn browse_folder(&mut self, cx: &mut Context<Self>) {
@@ -886,29 +890,42 @@ impl Omamusic {
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.background)
-            .child(self.cover(
-                current.map(|t| t.album_id.as_str()),
-                40.,
-                current.map_or("♪", |t| t.title.as_str()),
-                cx,
-            ))
             .child(
                 div()
+                    .id("now-playing")
                     .flex()
-                    .flex_col()
-                    .w(rems(10.))
-                    .min_w(rems(6.))
+                    .items_center()
+                    .gap(rems(0.75))
+                    .when(has_track, |d| d.cursor_pointer())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(track) = this.player.current() {
+                            this.open_album(track.album_id, cx);
+                        }
+                    }))
+                    .child(self.cover(
+                        current.map(|t| t.album_id.as_str()),
+                        40.,
+                        current.map_or("♪", |t| t.title.as_str()),
+                        cx,
+                    ))
                     .child(
                         div()
-                            .text_size(rems(0.75))
-                            .text_color(theme.foreground)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(rems(0.6875))
-                            .text_color(theme.secondary)
-                            .child(sub),
+                            .flex()
+                            .flex_col()
+                            .w(rems(10.))
+                            .min_w(rems(6.))
+                            .child(
+                                div()
+                                    .text_size(rems(0.75))
+                                    .text_color(theme.foreground)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(rems(0.6875))
+                                    .text_color(theme.secondary)
+                                    .child(sub),
+                            ),
                     ),
             )
             .child(
@@ -916,58 +933,73 @@ impl Omamusic {
                     .flex()
                     .items_center()
                     .gap(rems(0.375))
-                    .child(Self::control_button(
-                        "shuffle",
-                        IconName::Shuffle,
+                    .child(with_tooltip(
+                        Self::control_button(
+                            "shuffle",
+                            IconName::Shuffle,
+                            "Shuffle",
+                            toggled(shuffle),
+                            !has_track,
+                            |p| p.set_shuffle(!p.shuffle()),
+                            cx,
+                        ),
                         "Shuffle",
-                        toggled(shuffle),
-                        "Shuffle",
-                        |p| p.set_shuffle(!p.shuffle()),
-                        cx,
                     ))
-                    .child(Self::control_button(
-                        "prev",
-                        IconName::SkipBack,
+                    .child(with_tooltip(
+                        Self::control_button(
+                            "prev",
+                            IconName::SkipBack,
+                            "Previous",
+                            ButtonVariant::Secondary,
+                            !has_track,
+                            Player::previous,
+                            cx,
+                        ),
                         "Previous",
-                        ButtonVariant::Secondary,
-                        "Previous",
-                        Player::previous,
-                        cx,
                     ))
-                    .child(Self::control_button(
-                        "play",
-                        if playing {
-                            IconName::Pause
-                        } else {
-                            IconName::Play
-                        },
-                        if playing { "Pause" } else { "Play" },
-                        ButtonVariant::Primary,
+                    .child(with_tooltip(
+                        Self::control_button(
+                            "play",
+                            if playing {
+                                IconName::Pause
+                            } else {
+                                IconName::Play
+                            },
+                            if playing { "Pause" } else { "Play" },
+                            ButtonVariant::Primary,
+                            !has_track,
+                            Player::toggle,
+                            cx,
+                        ),
                         "Play/Pause (Space)",
-                        Player::toggle,
-                        cx,
                     ))
-                    .child(Self::control_button(
-                        "next",
-                        IconName::SkipForward,
+                    .child(with_tooltip(
+                        Self::control_button(
+                            "next",
+                            IconName::SkipForward,
+                            "Next",
+                            ButtonVariant::Secondary,
+                            !has_track,
+                            Player::next,
+                            cx,
+                        ),
                         "Next",
-                        ButtonVariant::Secondary,
-                        "Next",
-                        Player::next,
-                        cx,
                     ))
-                    .child(Self::control_button(
-                        "repeat",
-                        if repeat == RepeatMode::One {
-                            IconName::Repeat1
-                        } else {
-                            IconName::Repeat
-                        },
+                    .child(with_tooltip(
+                        Self::control_button(
+                            "repeat",
+                            if repeat == RepeatMode::One {
+                                IconName::Repeat1
+                            } else {
+                                IconName::Repeat
+                            },
+                            "Repeat",
+                            toggled(repeat != RepeatMode::Off),
+                            !has_track,
+                            |p| p.set_repeat(p.repeat().next()),
+                            cx,
+                        ),
                         "Repeat",
-                        toggled(repeat != RepeatMode::Off),
-                        "Repeat",
-                        |p| p.set_repeat(p.repeat().next()),
-                        cx,
                     )),
             )
             .child(
