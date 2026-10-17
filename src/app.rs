@@ -2,6 +2,7 @@ use crate::config::AppConfig;
 use crate::library::{Library, LibrarySnapshot};
 use crate::models::{Album, PlayerState, RepeatMode, Section, Track};
 use crate::player::Player;
+use crate::FocusSearch;
 use gpui_kit::base::input::InputState;
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::prelude::FluentBuilder;
@@ -204,6 +205,13 @@ impl Omamusic {
         cx.notify();
     }
 
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.query.update(cx, |q, cx| {
+            q.set_value("", window, cx);
+            q.focus(window, cx);
+        });
+    }
+
     fn browse_folder(&mut self, cx: &mut Context<Self>) {
         let path = self.new_folder.read(cx).text().to_string();
         if !path.is_empty() {
@@ -276,6 +284,9 @@ impl Render for Omamusic {
         ];
 
         focus_scope("omamusic")
+            .on_action(
+                cx.listener(|this, _: &FocusSearch, window, cx| this.focus_search(window, cx)),
+            )
             .size_full()
             .bg(theme.background)
             .child(

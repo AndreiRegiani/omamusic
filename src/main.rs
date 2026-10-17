@@ -15,7 +15,10 @@ use crate::config::AppConfig;
 use crate::library::Library;
 use crate::player::Player;
 
-actions!(omamusic, [TogglePlay, NextTrack, PrevTrack, Rescan]);
+actions!(
+    omamusic,
+    [TogglePlay, NextTrack, PrevTrack, Rescan, FocusSearch]
+);
 
 fn main() {
     if std::env::args().any(|a| a == "--dump-library") {
@@ -32,6 +35,7 @@ fn main() {
                 gpui_kit::KeyBinding::new("right", NextTrack, None),
                 gpui_kit::KeyBinding::new("left", PrevTrack, None),
                 gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
+                gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
             ]);
 
             let library = Arc::new(Library::new().expect("library"));
