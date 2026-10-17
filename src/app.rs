@@ -385,12 +385,22 @@ impl Render for Omamusic {
                                     .flex_col()
                                     .bg(theme.background)
                                     .child(if snap.folders.is_empty() {
-                                        empty_state(
-                                            "No Music",
-                                            "Add a folder with music in Settings.",
-                                            cx,
-                                        )
-                                        .into_any_element()
+                                        empty_state("No Music", "Add a folder with music.", cx)
+                                            .child(
+                                                button(
+                                                    "empty-add-folder",
+                                                    "Add Folder…",
+                                                    ButtonVariant::Primary,
+                                                    cx,
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.browse_folder(cx)
+                                                })),
+                                            )
+                                            .into_any_element()
+                                    } else if snap.albums.is_empty() && snap.scanning {
+                                        empty_state("Scanning…", "Reading the music folders.", cx)
+                                            .into_any_element()
                                     } else {
                                         self.render_content(&snap, cx)
                                     }),
