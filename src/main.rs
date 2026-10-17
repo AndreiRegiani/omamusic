@@ -17,7 +17,14 @@ use crate::player::Player;
 
 actions!(
     omamusic,
-    [TogglePlay, NextTrack, PrevTrack, Rescan, FocusSearch]
+    [
+        TogglePlay,
+        NextTrack,
+        PrevTrack,
+        Rescan,
+        FocusSearch,
+        GoBack
+    ]
 );
 
 fn main() {
@@ -36,6 +43,7 @@ fn main() {
                 gpui_kit::KeyBinding::new("left", PrevTrack, None),
                 gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
                 gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
+                gpui_kit::KeyBinding::new("alt-left", GoBack, None),
             ]);
 
             let library = Arc::new(Library::new().expect("library"));

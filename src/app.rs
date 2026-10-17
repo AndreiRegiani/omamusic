@@ -2,14 +2,14 @@ use crate::config::AppConfig;
 use crate::library::{Library, LibrarySnapshot};
 use crate::models::{Album, PlayerState, RepeatMode, Section, Track};
 use crate::player::Player;
-use crate::FocusSearch;
+use crate::{FocusSearch, GoBack};
 use gpui_kit::base::input::InputState;
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, rems, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity,
-    ImageSource, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Render,
-    StatefulInteractiveElement, Styled, Window,
+    ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
+    PathPromptOptions, Render, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, panel,
@@ -29,13 +29,18 @@ pub struct Omamusic {
     query: Entity<InputState>,
     volume: Entity<SliderState>,
     progress_state: Entity<SliderState>,
-    selected_album: Option<String>,
-    selected_artist: Option<String>,
+    pages: Vec<Page>,
     show_settings: bool,
     lib_version: u64,
     was_playing: bool,
     seeking: bool,
     new_folder: Entity<InputState>,
+}
+
+#[derive(Clone, PartialEq)]
+enum Page {
+    Album(String),
+    Artist(String),
 }
 
 fn initials(text: &str) -> String {
@@ -84,8 +89,7 @@ impl Omamusic {
         cx.observe(&query, |this, state, cx| {
             let text = state.read(cx).text().to_string();
             this.library.set_query(text);
-            this.selected_album = None;
-            this.selected_artist = None;
+            this.pages.clear();
             cx.notify();
         })
         .detach();
@@ -127,15 +131,19 @@ impl Omamusic {
         .detach();
 
         let view = std::env::var("OMADRIVE_VIEW").ok();
-        let (section, selected_album, show_settings) = match view.as_deref() {
-            Some("artists") => (Section::Artists, None, false),
-            Some("songs") => (Section::Songs, None, false),
-            Some("settings") => (Section::Albums, None, true),
+        let (section, pages, show_settings) = match view.as_deref() {
+            Some("artists") => (Section::Artists, Vec::new(), false),
+            Some("songs") => (Section::Songs, Vec::new(), false),
+            Some("settings") => (Section::Albums, Vec::new(), true),
             Some("album") => {
                 let first = library.snapshot().albums.first().map(|a| a.id.clone());
-                (Section::Albums, first, false)
+                (
+                    Section::Albums,
+                    first.map(Page::Album).into_iter().collect(),
+                    false,
+                )
             }
-            _ => (Section::Albums, None, false),
+            _ => (Section::Albums, Vec::new(), false),
         };
 
         Self {
@@ -145,8 +153,7 @@ impl Omamusic {
             query,
             volume,
             progress_state,
-            selected_album,
-            selected_artist: None,
+            pages,
             show_settings,
             lib_version: 0,
             was_playing: false,
@@ -198,10 +205,21 @@ impl Omamusic {
             }))
     }
 
-    fn open_album(&mut self, album_id: String, cx: &mut Context<Self>) {
-        self.section = Section::Albums;
-        self.selected_artist = None;
-        self.selected_album = Some(album_id);
+    fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.pages.last() != Some(&page) {
+            self.pages.push(page);
+        }
+        cx.notify();
+    }
+
+    fn back(&mut self, cx: &mut Context<Self>) {
+        self.pages.pop();
+        cx.notify();
+    }
+
+    fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        self.pages.clear();
         cx.notify();
     }
 
@@ -287,6 +305,11 @@ impl Render for Omamusic {
             .on_action(
                 cx.listener(|this, _: &FocusSearch, window, cx| this.focus_search(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &GoBack, _, cx| this.back(cx)))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.back(cx)),
+            )
             .size_full()
             .bg(theme.background)
             .child(
@@ -369,10 +392,7 @@ impl Render for Omamusic {
                                             self.section == section,
                                             cx,
                                             cx.listener(move |this, _, _, cx| {
-                                                this.section = section;
-                                                this.selected_album = None;
-                                                this.selected_artist = None;
-                                                cx.notify();
+                                                this.set_section(section, cx)
                                             }),
                                         )
                                     }))
@@ -436,15 +456,14 @@ impl Render for Omamusic {
 
 impl Omamusic {
     fn render_content(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(album) = self
-            .selected_album
-            .as_ref()
-            .and_then(|id| snap.albums.iter().find(|a| &a.id == id))
-        {
-            return self.render_album_detail(album, cx);
-        }
-        if let Some(name) = self.selected_artist.clone() {
-            return self.render_artist_albums(&name, snap, cx);
+        match self.pages.last().cloned() {
+            Some(Page::Album(id)) => {
+                if let Some(album) = snap.albums.iter().find(|a| a.id == id) {
+                    return self.render_album_detail(album, cx);
+                }
+            }
+            Some(Page::Artist(name)) => return self.render_artist_albums(&name, snap, cx),
+            None => {}
         }
         match self.section {
             Section::Albums => self.render_album_grid(&snap.filtered_albums, cx),
@@ -463,7 +482,7 @@ impl Omamusic {
         let albums: Vec<Album> = snap
             .albums
             .iter()
-            .filter(|a| a.artist == name)
+            .filter(|a| a.artist == name || a.tracks.iter().any(|t| t.artist == name))
             .cloned()
             .collect();
         div()
@@ -479,12 +498,8 @@ impl Omamusic {
                     .px(rems(0.75))
                     .pt(rems(0.75))
                     .child(
-                        button("artist-back", "Back", ButtonVariant::Secondary, cx).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.selected_artist = None;
-                                cx.notify();
-                            }),
-                        ),
+                        button("artist-back", "Back", ButtonVariant::Secondary, cx)
+                            .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
                     )
                     .child(
                         div()
@@ -525,8 +540,7 @@ impl Omamusic {
                         .cursor_pointer()
                         .child(self.cover(Some(&a.id), 128., &a.title, cx))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected_album = Some(id.clone());
-                            cx.notify();
+                            this.navigate(Page::Album(id.clone()), cx)
                         }))
                         .child(
                             div()
@@ -592,8 +606,7 @@ impl Omamusic {
                                         cx,
                                     ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.selected_artist = Some(aname.clone());
-                                        cx.notify();
+                                        this.navigate(Page::Artist(aname.clone()), cx)
                                     }))
                                     .child(
                                         div()
@@ -780,10 +793,9 @@ impl Omamusic {
                                                     ButtonVariant::Secondary,
                                                     cx,
                                                 )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.selected_album = None;
-                                                    cx.notify();
-                                                })),
+                                                .on_click(
+                                                    cx.listener(|this, _, _, cx| this.back(cx)),
+                                                ),
                                             ),
                                     ),
                             ),
@@ -910,7 +922,7 @@ impl Omamusic {
                     .when(has_track, |d| d.cursor_pointer())
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(track) = this.player.current() {
-                            this.open_album(track.album_id, cx);
+                            this.navigate(Page::Album(track.album_id), cx);
                         }
                     }))
                     .child(self.cover(
