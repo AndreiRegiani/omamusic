@@ -8,10 +8,11 @@ mod metadata;
 mod models;
 mod mpris;
 mod player;
+mod tray;
 
 use app::Omamusic;
 use desktop::Command;
-use gpui_kit::{actions, px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
+use gpui_kit::{actions, px, size, App, AppContext, Bounds, QuitMode, WindowBounds, WindowOptions};
 use std::sync::Arc;
 
 use crate::config::AppConfig;
@@ -26,7 +27,8 @@ actions!(
         PrevTrack,
         Rescan,
         FocusSearch,
-        GoBack
+        GoBack,
+        Quit
     ]
 );
 
@@ -42,6 +44,7 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
             gpui_omarchy::init(cx);
+            cx.set_quit_mode(QuitMode::Explicit);
 
             cx.bind_keys([
                 gpui_kit::KeyBinding::new("space", TogglePlay, None),
@@ -50,13 +53,17 @@ fn main() {
                 gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
                 gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
                 gpui_kit::KeyBinding::new("alt-left", GoBack, None),
+                gpui_kit::KeyBinding::new("ctrl-q", Quit, None),
             ]);
 
             let library = Arc::new(Library::new().expect("library"));
             let config = AppConfig::load();
             let player = Arc::new(Player::new(config.volume).expect("player"));
+            desktop::set_cover_icon(!config.plain_tray_icon);
             let (commands, received) = async_channel::unbounded();
-            desktop::start(player.clone(), library.clone(), commands);
+            let has_tray = desktop::start(player.clone(), library.clone(), commands);
+
+            cx.on_action(|_: &Quit, cx| cx.quit());
 
             cx.on_action({
                 let player = player.clone();
@@ -87,6 +94,23 @@ fn main() {
                 }
             });
 
+            cx.on_window_closed(move |cx, _| {
+                if !cx.windows().is_empty() {
+                    return;
+                }
+                let config = AppConfig::load();
+                if !has_tray || config.quit_on_close {
+                    cx.quit();
+                } else if !config.tray_hint_shown {
+                    AppConfig::update(|c| c.tray_hint_shown = true);
+                    desktop::notify(
+                        "omamusic is still running",
+                        "Find it in the tray. To stop playback and exit, choose Quit from the tray menu.",
+                    );
+                }
+            })
+            .detach();
+
             cx.spawn({
                 let library = library.clone();
                 let player = player.clone();
@@ -95,13 +119,21 @@ fn main() {
                         cx.update(|cx| match command {
                             Command::Quit => cx.quit(),
                             Command::ShowWindow => show_window(&library, &player, cx),
+                            Command::ToggleWindow => match cx.windows().first() {
+                                Some(window) => {
+                                    let _ = window.update(cx, |_, window, _| window.remove_window());
+                                }
+                                None => show_window(&library, &player, cx),
+                            },
                         });
                     }
                 }
             })
             .detach();
 
-            show_window(&library, &player, cx);
+            if !(has_tray && config.start_hidden) {
+                show_window(&library, &player, cx);
+            }
             cx.activate(true);
         });
 }
