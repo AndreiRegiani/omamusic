@@ -2,14 +2,95 @@ use crate::desktop::{Command, NowPlaying};
 use crate::models::PlayerState;
 use crate::player::Player;
 use async_channel::Sender;
+use gpui_kit::AssetSource;
 use ksni::menu::StandardItem;
 use ksni::{Icon, MenuItem, Orientation, ToolTip};
+use resvg::{tiny_skia, usvg};
 use std::sync::Arc;
+
+const MENU_ICON_SIZE: u32 = 32;
+const TRAY_ICON_SIZE: u32 = 64;
+const DEFAULT_FOREGROUND: &str = "#cacccc";
+
+struct Icons {
+    color: String,
+    play: Vec<u8>,
+    pause: Vec<u8>,
+    previous: Vec<u8>,
+    next: Vec<u8>,
+    show: Vec<u8>,
+    quit: Vec<u8>,
+    idle: Option<Icon>,
+}
+
+fn theme_foreground() -> String {
+    let state = dirs::state_dir().unwrap_or_default();
+    std::fs::read_to_string(state.join("omarchy/current/theme/colors.toml"))
+        .ok()
+        .and_then(|colors| {
+            colors.lines().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == "foreground").then(|| value.trim().trim_matches('"').to_string())
+            })
+        })
+        .unwrap_or_else(|| DEFAULT_FOREGROUND.into())
+}
+
+fn render(name: &str, color: &str, size: u32) -> Option<tiny_skia::Pixmap> {
+    let svg = gpui_kit::assets::AllAssets
+        .load(&format!("icons/{name}.svg"))
+        .ok()??;
+    let svg = String::from_utf8_lossy(&svg).replace("currentColor", color);
+    let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(size, size)?;
+    let scale = size as f32 / tree.size().width();
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Some(pixmap)
+}
+
+fn png(name: &str, color: &str) -> Vec<u8> {
+    render(name, color, MENU_ICON_SIZE)
+        .and_then(|pixmap| pixmap.encode_png().ok())
+        .unwrap_or_default()
+}
+
+impl Icons {
+    fn load() -> Self {
+        let color = theme_foreground();
+        let idle = render("music", &color, TRAY_ICON_SIZE).map(|pixmap| Icon {
+            width: pixmap.width() as i32,
+            height: pixmap.height() as i32,
+            data: pixmap
+                .pixels()
+                .iter()
+                .flat_map(|p| {
+                    let c = p.demultiply();
+                    [c.alpha(), c.red(), c.green(), c.blue()]
+                })
+                .collect(),
+        });
+        Self {
+            play: png("play", &color),
+            pause: png("pause", &color),
+            previous: png("skip-back", &color),
+            next: png("skip-forward", &color),
+            show: png("app-window", &color),
+            quit: png("power", &color),
+            idle,
+            color,
+        }
+    }
+}
 
 pub struct Tray {
     pub now: NowPlaying,
     player: Arc<Player>,
     commands: Sender<Command>,
+    icons: Icons,
 }
 
 impl Tray {
@@ -18,6 +99,7 @@ impl Tray {
             now: NowPlaying::default(),
             player,
             commands,
+            icons: Icons::load(),
         }
     }
 
@@ -35,14 +117,10 @@ impl Tray {
     }
 }
 
-fn item(
-    label: &str,
-    icon_name: &str,
-    activate: impl Fn(&mut Tray) + Send + 'static,
-) -> MenuItem<Tray> {
+fn item(label: &str, icon: &[u8], activate: impl Fn(&mut Tray) + Send + 'static) -> MenuItem<Tray> {
     StandardItem {
         label: label.into(),
-        icon_name: icon_name.into(),
+        icon_data: icon.to_vec(),
         activate: Box::new(activate),
         ..Default::default()
     }
@@ -58,16 +136,18 @@ impl ksni::Tray for Tray {
         "omamusic".into()
     }
 
-    fn icon_name(&self) -> String {
-        if self.cover_icon().is_some() {
-            String::new()
-        } else {
-            "audio-x-generic".into()
-        }
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        self.cover_icon()
+            .or(self.icons.idle.as_ref())
+            .cloned()
+            .into_iter()
+            .collect()
     }
 
-    fn icon_pixmap(&self) -> Vec<Icon> {
-        self.cover_icon().cloned().into_iter().collect()
+    fn menu_about_to_show(&mut self) {
+        if theme_foreground() != self.icons.color {
+            self.icons = Icons::load();
+        }
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -115,7 +195,7 @@ impl ksni::Tray for Tray {
             menu.push(
                 StandardItem {
                     label: format!("{} — {}", track.title, track.artist).replace('_', "__"),
-                    enabled: false,
+                    activate: Box::new(|tray: &mut Self| tray.send(Command::ShowWindow)),
                     icon_data: self
                         .now
                         .cover
@@ -128,35 +208,51 @@ impl ksni::Tray for Tray {
             );
             menu.push(MenuItem::Separator);
         }
-        let (label, icon_name) = if self.now.state == PlayerState::Playing {
-            ("Pause", "media-playback-pause")
+        let icons = &self.icons;
+        let (label, icon) = if self.now.state == PlayerState::Playing {
+            ("Pause", &icons.pause)
         } else {
-            ("Play", "media-playback-start")
+            ("Play", &icons.play)
         };
-        menu.extend([
-            item(label, icon_name, |tray| tray.player.toggle()),
-            item("Previous", "media-skip-backward", |tray| {
-                tray.player.previous()
-            }),
-            item("Next", "media-skip-forward", |tray| tray.player.next()),
-        ]);
-        if !has_track {
-            for entry in &mut menu {
-                if let MenuItem::Standard(standard) = entry {
-                    standard.enabled = false;
-                }
+        let controls = [
+            item(label, icon, |tray| tray.player.toggle()),
+            item("Previous", &icons.previous, |tray| tray.player.previous()),
+            item("Next", &icons.next, |tray| tray.player.next()),
+        ];
+        menu.extend(controls.into_iter().map(|mut entry| {
+            if let MenuItem::Standard(standard) = &mut entry {
+                standard.enabled = has_track;
             }
-        }
+            entry
+        }));
         menu.extend([
             MenuItem::Separator,
-            item("Show omamusic", "window-new", |tray| {
+            item("Show omamusic", &icons.show, |tray| {
                 tray.send(Command::ShowWindow)
             }),
             MenuItem::Separator,
-            item("Quit omamusic", "application-exit", |tray| {
+            item("Quit omamusic", &icons.quit, |tray| {
                 tray.send(Command::Quit)
             }),
         ]);
         menu
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_icons_render_in_the_theme_color() {
+        let icon = png("pause", "#ff0000");
+        let decoded = image::load_from_memory(&icon).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (MENU_ICON_SIZE, MENU_ICON_SIZE));
+        assert!(decoded.pixels().any(|p| p.0 == [255, 0, 0, 255]));
+        let idle = Icons::load().idle.unwrap();
+        assert_eq!(
+            idle.data.len(),
+            (TRAY_ICON_SIZE * TRAY_ICON_SIZE * 4) as usize
+        );
     }
 }
