@@ -18,7 +18,7 @@ use std::time::Duration;
 
 type AudioSource = UniformSourceIterator<Decoder<BufReader<File>>>;
 
-const OUTPUT_FRAMES: u32 = 1024;
+const PULSE_FRAMES: u32 = 1024;
 
 #[derive(Default)]
 struct Playback {
@@ -316,13 +316,15 @@ fn run_decoder(shared: Arc<Shared>, commands: Receiver<Command>) {
 
 impl Player {
     pub fn new(volume: f64) -> Result<Self> {
-        let preferred = cpal::default_host().id();
-        let mut hosts = vec![preferred];
-        hosts.extend(
-            cpal::available_hosts()
-                .into_iter()
-                .filter(|id| *id != preferred),
-        );
+        let mut hosts = Vec::new();
+        for id in [cpal::HostId::Alsa, cpal::default_host().id()]
+            .into_iter()
+            .chain(cpal::available_hosts())
+        {
+            if !hosts.contains(&id) {
+                hosts.push(id);
+            }
+        }
         let mut failures = Vec::new();
         for id in hosts {
             let Ok(host) = cpal::host_from_id(id) else {
@@ -332,7 +334,7 @@ impl Player {
                 failures.push(format!("{id}: no default output device"));
                 continue;
             };
-            match Self::from_device(&device, volume) {
+            match Self::from_device(&device, id, volume) {
                 Ok(player) => return Ok(player),
                 Err(err) => failures.push(format!("{id}: {err:#}")),
             }
@@ -340,7 +342,7 @@ impl Player {
         anyhow::bail!("no usable audio output: {}", failures.join("; "))
     }
 
-    fn from_device(device: &cpal::Device, volume: f64) -> Result<Self> {
+    fn from_device(device: &cpal::Device, host: cpal::HostId, volume: f64) -> Result<Self> {
         let mut supported = device
             .default_output_config()
             .context("query audio output")?;
@@ -359,7 +361,9 @@ impl Player {
         }
         let mut config = supported.config();
         if let cpal::SupportedBufferSize::Range { min, max } = supported.buffer_size() {
-            config.buffer_size = cpal::BufferSize::Fixed(OUTPUT_FRAMES.clamp(*min, *max));
+            if host == cpal::HostId::PulseAudio {
+                config.buffer_size = cpal::BufferSize::Fixed(PULSE_FRAMES.clamp(*min, *max));
+            }
         }
         if config.channels == 0 || config.sample_rate == 0 {
             anyhow::bail!("audio device reported an invalid stream configuration");
