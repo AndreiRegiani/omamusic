@@ -1162,7 +1162,6 @@ impl Omamusic {
             .into_any_element();
         }
         let playing = self.player.state() == PlayerState::Playing;
-        let queue: Arc<[Track]> = queue.into();
         div()
             .flex_1()
             .min_h_0()

@@ -22,7 +22,7 @@ const OUTPUT_FRAMES: u32 = 1024;
 
 #[derive(Default)]
 struct Playback {
-    queue: Vec<Track>,
+    queue: Arc<[Track]>,
     order: Vec<Track>,
     index: usize,
     state: PlayerState,
@@ -99,6 +99,12 @@ fn following(index: usize, len: usize, repeat: RepeatMode, manual: bool) -> Opti
     }
 }
 
+fn edit(queue: &mut Arc<[Track]>, change: impl FnOnce(&mut Vec<Track>)) {
+    let mut tracks = queue.to_vec();
+    change(&mut tracks);
+    *queue = tracks.into();
+}
+
 fn select(playback: &mut Playback, index: usize) -> Option<Track> {
     playback.index = index;
     let track = playback.queue.get(index)?.clone();
@@ -121,7 +127,9 @@ fn insert(playback: &mut Playback, tracks: Vec<Track>, next: bool) {
         (playback.queue.len(), playback.order.len())
     };
     let at = at.min(playback.queue.len());
-    playback.queue.splice(at..at, tracks.iter().cloned());
+    edit(&mut playback.queue, |queue| {
+        queue.splice(at..at, tracks.iter().cloned());
+    });
     playback.order.splice(order_at..order_at, tracks);
 }
 
@@ -129,11 +137,12 @@ fn remove(playback: &mut Playback, indices: &[usize]) {
     let mut indices = indices.to_vec();
     indices.sort_unstable_by(|a, b| b.cmp(a));
     indices.dedup();
+    let mut queue = playback.queue.to_vec();
     for i in indices {
-        if i == playback.index || i >= playback.queue.len() {
+        if i == playback.index || i >= queue.len() {
             continue;
         }
-        let track = playback.queue.remove(i);
+        let track = queue.remove(i);
         if i < playback.index {
             playback.index -= 1;
         }
@@ -141,6 +150,7 @@ fn remove(playback: &mut Playback, indices: &[usize]) {
             playback.order.remove(pos);
         }
     }
+    playback.queue = queue.into();
 }
 
 fn stop(playback: &mut Playback) {
@@ -403,16 +413,17 @@ impl Player {
         let track = {
             let mut p = self.shared.playback.lock();
             p.order = tracks.clone();
-            p.queue = tracks;
-            let start = at.min(p.queue.len() - 1);
+            let mut queue = tracks;
+            let start = at.min(queue.len() - 1);
             let index = if p.shuffle {
-                let first = p.queue.remove(start);
-                p.queue.shuffle(&mut rand::thread_rng());
-                p.queue.insert(0, first);
+                let first = queue.remove(start);
+                queue.shuffle(&mut rand::thread_rng());
+                queue.insert(0, first);
                 0
             } else {
                 start
             };
+            p.queue = queue.into();
             select(&mut p, index)
         };
         self.load(track);
@@ -459,7 +470,7 @@ impl Player {
         self.shared.changed();
     }
 
-    pub fn queue(&self) -> (Vec<Track>, Option<usize>) {
+    pub fn queue(&self) -> (Arc<[Track]>, Option<usize>) {
         let p = self.shared.playback.lock();
         (p.queue.clone(), p.current.is_some().then_some(p.index))
     }
@@ -501,7 +512,7 @@ impl Player {
     pub fn stop(&self) {
         let mut p = self.shared.playback.lock();
         stop(&mut p);
-        p.queue.clear();
+        p.queue = Arc::new([]);
         p.order.clear();
         let _ = self.commands.send(Command::Clear);
         drop(p);
@@ -556,12 +567,14 @@ impl Player {
         p.shuffle = enabled;
         if let Some(current) = p.current.clone() {
             if enabled {
-                p.queue.retain(|track| track.path != current.path);
-                p.queue.shuffle(&mut rand::thread_rng());
-                p.queue.insert(0, current);
+                edit(&mut p.queue, |queue| {
+                    queue.retain(|track| track.path != current.path);
+                    queue.shuffle(&mut rand::thread_rng());
+                    queue.insert(0, current);
+                });
                 p.index = 0;
             } else {
-                p.queue = p.order.clone();
+                p.queue = p.order.as_slice().into();
                 p.index = p
                     .order
                     .iter()
@@ -667,7 +680,7 @@ mod tests {
         Playback {
             current: queue.get(index).cloned(),
             order: order.iter().map(|n| named(n)).collect(),
-            queue,
+            queue: queue.into(),
             index,
             ..Default::default()
         }
