@@ -221,6 +221,16 @@ impl Omamusic {
         })
         .detach();
 
+        let covers = library.covers().ready();
+        cx.spawn(async move |this, cx| {
+            while covers.recv().await.is_ok() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         let view = std::env::var("OMADRIVE_VIEW").ok();
         let (section, pages, show_settings) = match view.as_deref() {
             Some("artists") => (Section::Artists, Vec::new(), false),
@@ -279,7 +289,7 @@ impl Omamusic {
 
     fn cover(&self, album_id: Option<&str>, size: f32, name: &str, cx: &App) -> impl IntoElement {
         let cover = avatar(initials(name), cx).size(px(size));
-        match album_id.and_then(|id| self.library.covers().thumbnail(id, size as u32 * 2)) {
+        match album_id.and_then(|id| self.library.covers().cached(id, size as u32 * 2)) {
             Some(image) => cover.image(avatar_image(ImageSource::Image(image))),
             None => cover,
         }
