@@ -14,7 +14,8 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
-    separator, slider, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName, MenuItem,
+    separator, slider, switch, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName,
+    MenuItem,
 };
 use rand::Rng;
 use std::collections::BTreeSet;
@@ -37,6 +38,8 @@ pub struct Omamusic {
     show_settings: bool,
     lib_version: u64,
     was_playing: bool,
+    last_track: Option<PathBuf>,
+    prefs: AppConfig,
     seeking: bool,
     new_folder: Entity<InputState>,
 }
@@ -238,6 +241,8 @@ impl Omamusic {
             show_settings,
             lib_version: 0,
             was_playing: false,
+            last_track: None,
+            prefs: AppConfig::load(),
             seeking: false,
             new_folder,
         }
@@ -246,9 +251,12 @@ impl Omamusic {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let version = self.library.version();
         let playing = self.player.state() == PlayerState::Playing;
-        if version == self.lib_version && !playing && !self.was_playing {
+        let track = self.player.current().map(|t| t.path);
+        if version == self.lib_version && !playing && !self.was_playing && track == self.last_track
+        {
             return;
         }
+        self.last_track = track;
         if version != self.lib_version {
             self.clear_selection();
         }
@@ -460,6 +468,25 @@ impl Omamusic {
             q.set_value("", window, cx);
             q.focus(window, cx);
         });
+    }
+
+    fn pref_switch(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        checked: bool,
+        change: fn(&mut AppConfig, bool),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        switch(id, label, checked, cx).on_change(move |on, _, _, cx| {
+            let _ = this.update(cx, |this, cx| {
+                change(&mut this.prefs, on);
+                AppConfig::update(|c| change(c, on));
+                crate::desktop::set_cover_icon(!this.prefs.plain_tray_icon);
+                cx.notify();
+            });
+        })
     }
 
     fn browse_folder(&mut self, cx: &mut Context<Self>) {
@@ -1455,6 +1482,34 @@ impl Omamusic {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         panel("Settings", cx)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.25))
+                    .child(self.pref_switch(
+                        "pref-close-to-tray",
+                        "Close window to tray",
+                        !self.prefs.quit_on_close,
+                        |c, on| c.quit_on_close = !on,
+                        cx,
+                    ))
+                    .child(self.pref_switch(
+                        "pref-tray-cover",
+                        "Use album cover as tray icon",
+                        !self.prefs.plain_tray_icon,
+                        |c, on| c.plain_tray_icon = !on,
+                        cx,
+                    ))
+                    .child(self.pref_switch(
+                        "pref-start-hidden",
+                        "Start hidden in tray",
+                        self.prefs.start_hidden,
+                        |c, on| c.start_hidden = on,
+                        cx,
+                    )),
+            )
+            .child(separator(cx))
             .child(
                 div()
                     .flex()
