@@ -1,10 +1,8 @@
-use crate::config::AppConfig;
 use crate::library::{Library, LibrarySnapshot};
-use crate::models::{Album, PlayerState, RepeatMode, Section, Track};
+use crate::models::{Album, PlayerState, Section, Track};
 use crate::player::Player;
 use crate::{FocusSearch, GoBack};
 use gpui_kit::base::input::InputState;
-use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
@@ -14,7 +12,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
-    separator, slider, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName, MenuItem,
+    separator, with_tooltip, ActiveTheme, ButtonVariant, IconName, MenuItem,
 };
 use rand::Rng;
 use std::collections::BTreeSet;
@@ -23,22 +21,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-const PROGRESS_STEPS: f32 = 1000.;
-
 pub struct Omamusic {
     pub library: Arc<Library>,
     pub player: Arc<Player>,
     section: Section,
     query: Entity<InputState>,
-    volume: Entity<SliderState>,
-    progress_state: Entity<SliderState>,
     pages: Vec<Page>,
     selection: BTreeSet<usize>,
     anchor: Option<usize>,
     show_settings: bool,
     lib_version: u64,
-    was_playing: bool,
-    seeking: bool,
     new_folder: Entity<InputState>,
 }
 
@@ -121,11 +113,25 @@ impl Selectable for MenuTrigger {
     }
 }
 
+pub fn cover(
+    library: &Library,
+    album_id: Option<&str>,
+    size: f32,
+    name: &str,
+    cx: &App,
+) -> impl IntoElement {
+    let cover = avatar(initials(name), cx).size(px(size));
+    match album_id.and_then(|id| library.covers().cached(id, size as u32 * 2)) {
+        Some(image) => cover.image(avatar_image(ImageSource::Image(image))),
+        None => cover,
+    }
+}
+
 fn initials(text: &str) -> String {
     text.chars().take(2).collect()
 }
 
-fn format_time(secs: f64) -> String {
+pub fn format_time(secs: f64) -> String {
     if !secs.is_finite() || secs <= 0.0 {
         return "0:00".into();
     }
@@ -148,22 +154,6 @@ impl Omamusic {
     ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
         let new_folder = cx.new(|cx| InputState::new(window, cx).placeholder("Enter folder path"));
-        let vol = player.volume() as f32;
-        let volume = cx.new(|_| {
-            SliderState::new()
-                .min(0.)
-                .max(1.)
-                .step(0.01)
-                .default_value(vol)
-        });
-        let progress_state = cx.new(|_| {
-            SliderState::new()
-                .min(0.)
-                .max(PROGRESS_STEPS)
-                .step(1.)
-                .default_value(0.)
-        });
-
         cx.observe(&query, |this, state, cx| {
             let text = state.read(cx).text().to_string();
             this.library.set_query(text);
@@ -173,36 +163,11 @@ impl Omamusic {
         })
         .detach();
 
-        cx.subscribe(&volume, |this, _, event: &SliderEvent, _| match event {
-            SliderEvent::Change(value) => this.player.set_volume(value.end() as f64),
-            SliderEvent::Release(_) => {
-                let volume = this.player.volume();
-                AppConfig::update(|c| c.volume = volume);
-            }
-        })
-        .detach();
-
-        cx.subscribe(
-            &progress_state,
-            |this, _, event: &SliderEvent, _| match event {
-                SliderEvent::Change(_) => this.seeking = true,
-                SliderEvent::Release(value) => {
-                    this.seeking = false;
-                    let dur = this.player.duration().max(1.0);
-                    this.player
-                        .seek(value.end() as f64 / PROGRESS_STEPS as f64 * dur);
-                }
-            },
-        )
-        .detach();
-
-        cx.spawn_in(window, async move |this, cx| loop {
+        cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
-            let alive = this
-                .update_in(cx, |this, window, cx| this.tick(false, window, cx))
-                .is_ok();
+            let alive = this.update(cx, |this, cx| this.tick(false, cx)).is_ok();
             if !alive {
                 break;
             }
@@ -210,11 +175,9 @@ impl Omamusic {
         .detach();
 
         let changes = player.subscribe();
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             while changes.recv().await.is_ok() {
-                let alive = this
-                    .update_in(cx, |this, window, cx| this.tick(true, window, cx))
-                    .is_ok();
+                let alive = this.update(cx, |this, cx| this.tick(true, cx)).is_ok();
                 if !alive {
                     break;
                 }
@@ -222,7 +185,7 @@ impl Omamusic {
         })
         .detach();
 
-        let covers = library.covers().ready();
+        let covers = library.covers().subscribe();
         cx.spawn(async move |this, cx| {
             while covers.recv().await.is_ok() {
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
@@ -254,63 +217,33 @@ impl Omamusic {
             player,
             section,
             query,
-            volume,
-            progress_state,
             pages,
             selection: BTreeSet::new(),
             anchor: None,
             show_settings,
             lib_version: 0,
-            was_playing: false,
-            seeking: false,
             new_folder,
         }
     }
 
-    fn tick(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn tick(&mut self, force: bool, cx: &mut Context<Self>) {
         let version = self.library.version();
-        let playing = self.player.state() == PlayerState::Playing;
-        if !force && version == self.lib_version && !playing && !self.was_playing {
+        if !force && version == self.lib_version {
             return;
         }
         if version != self.lib_version {
             self.clear_selection();
         }
         self.lib_version = version;
-        self.was_playing = playing;
-        if !self.seeking {
-            let dur = self.player.duration().max(1.0) as f32;
-            let value =
-                (self.player.position() as f32 / dur * PROGRESS_STEPS).clamp(0., PROGRESS_STEPS);
-            self.progress_state
-                .update(cx, |s, cx| s.set_value(value, window, cx));
-        }
         cx.notify();
     }
 
-    fn cover(&self, album_id: Option<&str>, size: f32, name: &str, cx: &App) -> impl IntoElement {
-        let cover = avatar(initials(name), cx).size(px(size));
-        match album_id.and_then(|id| self.library.covers().cached(id, size as u32 * 2)) {
-            Some(image) => cover.image(avatar_image(ImageSource::Image(image))),
-            None => cover,
-        }
+    pub fn show_album(&mut self, album_id: String, cx: &mut Context<Self>) {
+        self.navigate(Page::Album(album_id), cx);
     }
 
-    fn control_button(
-        id: &'static str,
-        icon_name: IconName,
-        label: &'static str,
-        variant: ButtonVariant,
-        disabled: bool,
-        action: fn(&Player),
-        cx: &mut Context<Self>,
-    ) -> Button {
-        icon_button(id, icon_name, label, variant, cx)
-            .disabled(disabled)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                action(&this.player);
-                cx.notify();
-            }))
+    fn cover(&self, album_id: Option<&str>, size: f32, name: &str, cx: &App) -> impl IntoElement {
+        cover(&self.library, album_id, size, name, cx)
     }
 
     fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
@@ -548,8 +481,6 @@ fn sidebar_btn(
 impl Render for Omamusic {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snap = self.library.snapshot();
-        let current = self.player.current();
-        let playing = self.player.state() == PlayerState::Playing;
         let theme = cx.omarchy().clone();
         let nav = [
             ("nav-albums", "Albums", IconName::Disc3, Section::Albums),
@@ -712,8 +643,6 @@ impl Render for Omamusic {
                                     ),
                             ),
                     )
-                    .child(separator(cx))
-                    .child(self.render_player_bar(current.as_ref(), playing, window, cx))
                     .when(self.show_settings, |d| {
                         d.child(self.render_settings(&snap, window, cx))
                     }),
@@ -1311,200 +1240,6 @@ impl Omamusic {
                     .child(format_time(t.duration)),
             );
         self.track_row("queue-menu", i, queue.clone(), true, row, cx)
-    }
-
-    fn render_player_bar(
-        &mut self,
-        current: Option<&Track>,
-        playing: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.omarchy().clone();
-        let has_track = current.is_some();
-        let pos = if has_track {
-            self.player.position()
-        } else {
-            0.0
-        };
-        let dur = if has_track {
-            self.player.duration().max(1.0)
-        } else {
-            0.0
-        };
-        let title = current
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| "Not Playing".into());
-        let sub = current
-            .map(|t| format!("{} — {}", t.artist, t.album))
-            .unwrap_or_default();
-        let shuffle = self.player.shuffle();
-        let repeat = self.player.repeat();
-        let toggled = |on: bool| {
-            if on {
-                ButtonVariant::Primary
-            } else {
-                ButtonVariant::Secondary
-            }
-        };
-
-        div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(rems(0.75))
-            .px(rems(0.75))
-            .py(rems(0.5))
-            .border_t_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .child(
-                div()
-                    .id("now-playing")
-                    .flex()
-                    .items_center()
-                    .gap(rems(0.75))
-                    .when(has_track, |d| d.cursor_pointer())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(track) = this.player.current() {
-                            this.navigate(Page::Album(track.album_id), cx);
-                        }
-                    }))
-                    .child(self.cover(
-                        current.map(|t| t.album_id.as_str()),
-                        40.,
-                        current.map_or("♪", |t| t.title.as_str()),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w(rems(10.))
-                            .min_w(rems(6.))
-                            .child(
-                                div()
-                                    .text_size(rems(0.75))
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(sub),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(rems(0.375))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "shuffle",
-                            IconName::Shuffle,
-                            "Shuffle",
-                            toggled(shuffle),
-                            !has_track,
-                            |p| p.set_shuffle(!p.shuffle()),
-                            cx,
-                        ),
-                        "Shuffle",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "prev",
-                            IconName::SkipBack,
-                            "Previous",
-                            ButtonVariant::Secondary,
-                            !has_track,
-                            Player::previous,
-                            cx,
-                        ),
-                        "Previous",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "play",
-                            if playing {
-                                IconName::Pause
-                            } else {
-                                IconName::Play
-                            },
-                            if playing { "Pause" } else { "Play" },
-                            ButtonVariant::Primary,
-                            !has_track,
-                            Player::toggle,
-                            cx,
-                        ),
-                        "Play/Pause (Space)",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "next",
-                            IconName::SkipForward,
-                            "Next",
-                            ButtonVariant::Secondary,
-                            !has_track,
-                            Player::next,
-                            cx,
-                        ),
-                        "Next",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "repeat",
-                            if repeat == RepeatMode::One {
-                                IconName::Repeat1
-                            } else {
-                                IconName::Repeat
-                            },
-                            "Repeat",
-                            toggled(repeat != RepeatMode::Off),
-                            !has_track,
-                            |p| p.set_repeat(p.repeat().next()),
-                            cx,
-                        ),
-                        "Repeat",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w(rems(6.))
-                    .items_center()
-                    .gap(rems(0.5))
-                    .child(
-                        div()
-                            .w(rems(3.))
-                            .text_size(rems(0.6875))
-                            .text_color(theme.secondary)
-                            .child(format_time(pos)),
-                    )
-                    .child(div().flex_1().min_w_0().child(slider(
-                        &self.progress_state,
-                        !has_track,
-                        window,
-                        cx,
-                    )))
-                    .child(
-                        div()
-                            .w(rems(3.))
-                            .text_size(rems(0.6875))
-                            .text_color(theme.secondary)
-                            .child(format_time(dur)),
-                    ),
-            )
-            .child(icon(IconName::Volume2).size(rems(0.875)))
-            .child(
-                div()
-                    .w(rems(6.))
-                    .min_w(rems(4.))
-                    .child(slider(&self.volume, false, window, cx)),
-            )
     }
 
     fn render_settings(

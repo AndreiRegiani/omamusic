@@ -1,4 +1,4 @@
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TrySendError};
 use gpui_kit::{Image, ImageFormat};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -19,28 +19,30 @@ struct Covers {
 pub struct ArtworkCache {
     inner: Arc<Mutex<Covers>>,
     requests: Sender<Key>,
-    ready: Receiver<()>,
+    listeners: Arc<Mutex<Vec<Sender<()>>>>,
 }
 
 impl Default for ArtworkCache {
     fn default() -> Self {
         let inner = Arc::new(Mutex::new(Covers::default()));
         let (requests, jobs) = async_channel::unbounded::<Key>();
-        let (done, ready) = async_channel::bounded(1);
+        let listeners: Arc<Mutex<Vec<Sender<()>>>> = Arc::default();
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
         for _ in 0..workers {
-            let (inner, jobs, done) = (inner.clone(), jobs.clone(), done.clone());
+            let (inner, jobs, listeners) = (inner.clone(), jobs.clone(), listeners.clone());
             std::thread::spawn(move || {
                 while let Ok(key) = jobs.recv_blocking() {
                     render_into(&inner, key);
-                    let _ = done.try_send(());
+                    listeners.lock().retain(|listener| {
+                        !matches!(listener.try_send(()), Err(TrySendError::Closed(_)))
+                    });
                 }
             });
         }
         Self {
             inner,
             requests,
-            ready,
+            listeners,
         }
     }
 }
@@ -93,7 +95,9 @@ impl ArtworkCache {
         None
     }
 
-    pub fn ready(&self) -> Receiver<()> {
-        self.ready.clone()
+    pub fn subscribe(&self) -> Receiver<()> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.listeners.lock().push(sender);
+        receiver
     }
 }

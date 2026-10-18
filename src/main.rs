@@ -6,9 +6,15 @@ mod library;
 mod metadata;
 mod models;
 mod player;
+mod player_bar;
 
 use app::Omamusic;
-use gpui_kit::{actions, px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
+use gpui_kit::{
+    actions, div, px, size, App, AppContext, Bounds, Context, Entity, IntoElement, ParentElement,
+    Render, StyleRefinement, Styled, Window, WindowBounds, WindowOptions,
+};
+use gpui_omarchy::{separator, ActiveTheme};
+use player_bar::PlayerBar;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
@@ -90,12 +96,47 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    cx.new(|cx| Omamusic::new(library.clone(), player.clone(), window, cx))
+                    cx.new(|cx| {
+                        let main =
+                            cx.new(|cx| Omamusic::new(library.clone(), player.clone(), window, cx));
+                        let bar = cx.new(|cx| {
+                            PlayerBar::new(
+                                library.clone(),
+                                player.clone(),
+                                main.downgrade(),
+                                window,
+                                cx,
+                            )
+                        });
+                        Root { main, bar }
+                    })
                 },
             )
             .expect("open omamusic");
             cx.activate(true);
         });
+}
+
+struct Root {
+    main: Entity<Omamusic>,
+    bar: Entity<PlayerBar>,
+}
+
+impl Render for Root {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(cx.omarchy().background)
+            .child(
+                self.main
+                    .clone()
+                    .cached(StyleRefinement::default().flex_1().min_h_0().w_full()),
+            )
+            .child(separator(cx))
+            .child(self.bar.clone())
+    }
 }
 
 fn dump_library() {
