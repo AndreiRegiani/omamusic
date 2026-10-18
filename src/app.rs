@@ -8,9 +8,9 @@ use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, rems, AnyElement, App, AppContext, ClickEvent, Context, Div, ElementId, Entity,
-    ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
-    PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
+    div, px, rems, uniform_list, AnyElement, App, AppContext, ClickEvent, Context, Div, ElementId,
+    Entity, ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection,
+    ParentElement, PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
@@ -18,6 +18,7 @@ use gpui_omarchy::{
 };
 use rand::Rng;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -706,7 +707,7 @@ impl Render for Omamusic {
                                             )
                                             .into_any_element()
                                         } else {
-                                            self.render_content(&snap, cx)
+                                            self.render_content(&snap, window, cx)
                                         },
                                     ),
                             ),
@@ -721,18 +722,25 @@ impl Render for Omamusic {
 }
 
 impl Omamusic {
-    fn render_content(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
+    fn render_content(
+        &mut self,
+        snap: &Arc<LibrarySnapshot>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match self.pages.last().cloned() {
             Some(Page::Album(id)) => {
                 if let Some(album) = snap.albums.iter().find(|a| a.id == id) {
                     return self.render_album_detail(album, cx);
                 }
             }
-            Some(Page::Artist(name)) => return self.render_artist_albums(&name, snap, cx),
+            Some(Page::Artist(name)) => return self.render_artist_albums(&name, snap, window, cx),
             None => {}
         }
         match self.section {
-            Section::Albums => self.render_album_grid(&snap.filtered_albums, cx),
+            Section::Albums => {
+                self.render_album_grid("albums", snap.filtered_albums.clone(), window, cx)
+            }
             Section::Artists => self.render_artist_list(snap, cx),
             Section::Songs => self.render_song_list(snap, cx),
             Section::Queue => self.render_queue(cx),
@@ -743,10 +751,11 @@ impl Omamusic {
         &mut self,
         name: &str,
         snap: &LibrarySnapshot,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.omarchy().clone();
-        let albums: Vec<Album> = snap
+        let albums: Arc<[Album]> = snap
             .albums
             .iter()
             .filter(|a| a.artist == name || a.tracks.iter().any(|t| t.artist == name))
@@ -775,212 +784,228 @@ impl Omamusic {
                             .child(name.to_string()),
                     ),
             )
-            .child(self.render_album_grid(&albums, cx))
+            .child(self.render_album_grid("artist-albums", albums, window, cx))
             .into_any_element()
     }
 
-    fn render_album_grid(&mut self, albums: &[Album], cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.omarchy().clone();
-        div()
-            .id("albums-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p(rems(0.75))
-            .child(div().flex().flex_wrap().gap(rems(0.75)).children(
-                albums.iter().take(400).enumerate().map(|(idx, a)| {
-                    let id = a.id.clone();
-                    let tracks = a.tracks.clone();
-                    let n = a.tracks.len();
-                    let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
-                    let artist = a.artist.clone();
-                    let card = div()
-                        .id(("album", idx))
-                        .w(rems(10.))
-                        .min_w(rems(8.))
-                        .flex()
-                        .flex_col()
-                        .gap(rems(0.375))
-                        .p(rems(0.5))
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.background)
-                        .hover(|s| s.bg(theme.hover_fill()))
-                        .cursor_pointer()
-                        .child(self.cover(Some(&a.id), 128., &a.title, cx))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.navigate(Page::Album(id.clone()), cx)
-                        }))
-                        .child(
-                            div()
-                                .text_size(rems(0.75))
-                                .text_color(theme.foreground)
-                                .child(a.title.clone()),
+    fn render_album_grid(
+        &mut self,
+        id: &'static str,
+        albums: Arc<[Album]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rem = window.rem_size();
+        let gap = rem * 0.75;
+        let width = window.viewport_size().width - rem * 11. - px(1.) - gap * 2.;
+        let columns = (((width + gap) / (rem * 10. + gap)).floor() as usize).max(1);
+        let rows = albums.len().div_ceil(columns);
+        uniform_list(
+            id,
+            rows,
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                range
+                    .map(|row| {
+                        let start = row * columns;
+                        let end = (start + columns).min(albums.len());
+                        div().flex().gap(gap).px(gap).pt(gap).children(
+                            (start..end).map(|idx| this.album_card(&albums[idx], idx, cx)),
                         )
-                        .child(
-                            div()
-                                .text_size(rems(0.6875))
-                                .text_color(theme.secondary)
-                                .child(a.artist.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(rems(0.6875))
-                                .text_color(theme.secondary)
-                                .child(count),
-                        );
-                    Self::context_menu(
-                        ("album-menu", idx),
-                        card,
-                        ALBUM_ACTIONS,
-                        move |this, action, cx| match action {
-                            RowAction::GoToArtist => {
-                                this.navigate(Page::Artist(artist.clone()), cx)
-                            }
-                            _ => this.tracks_action(action, &tracks, cx),
-                        },
-                        cx,
-                    )
-                }),
-            ))
-            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .pb(gap)
+        .into_any_element()
     }
 
-    fn render_artist_list(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
+    fn album_card(&self, a: &Album, idx: usize, cx: &mut Context<Self>) -> Popover {
         let theme = cx.omarchy().clone();
-        div()
-            .id("artists-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
+        let id = a.id.clone();
+        let tracks = a.tracks.clone();
+        let n = a.tracks.len();
+        let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
+        let artist = a.artist.clone();
+        let card = div()
+            .id(("album", idx))
+            .w(rems(10.))
+            .flex()
+            .flex_col()
+            .gap(rems(0.375))
+            .p(rems(0.5))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .child(self.cover(Some(&a.id), 128., &a.title, cx))
+            .on_click(cx.listener(move |this, _, _, cx| this.navigate(Page::Album(id.clone()), cx)))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .children(
-                        snap.artists
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, (name, albums))| {
-                                let song_count: usize = albums.iter().map(|a| a.tracks.len()).sum();
-                                let an = albums.len();
-                                let label = format!(
-                                    "{name} · {an} album{} · {song_count} songs",
-                                    if an == 1 { "" } else { "s" }
-                                );
-                                let aname = name.clone();
-                                let tracks: Vec<Track> = albums
-                                    .iter()
-                                    .flat_map(|a| a.tracks.iter().cloned())
-                                    .collect();
-                                let row = div()
-                                    .id(("artist", idx))
-                                    .flex()
-                                    .items_center()
-                                    .gap(rems(0.5))
-                                    .px(rems(0.75))
-                                    .py(rems(0.5))
-                                    .border_b_1()
-                                    .border_color(theme.border)
-                                    .hover(|s| s.bg(theme.hover_fill()))
-                                    .cursor_pointer()
-                                    .child(self.cover(
-                                        albums.first().map(|a| a.id.as_str()),
-                                        40.,
-                                        name,
-                                        cx,
-                                    ))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.navigate(Page::Artist(aname.clone()), cx)
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_size(rems(0.75))
-                                            .text_color(theme.foreground)
-                                            .child(label),
-                                    );
-                                Self::context_menu(
-                                    ("artist-menu", idx),
-                                    row,
-                                    ARTIST_ACTIONS,
-                                    move |this, action, cx| this.tracks_action(action, &tracks, cx),
-                                    cx,
-                                )
-                                .w_full()
-                            }),
-                    ),
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(a.title.clone()),
             )
-            .into_any_element()
+            .child(
+                div()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .truncate()
+                    .child(a.artist.clone()),
+            )
+            .child(
+                div()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .child(count),
+            );
+        Self::context_menu(
+            ("album-menu", idx),
+            card,
+            ALBUM_ACTIONS,
+            move |this, action, cx| match action {
+                RowAction::GoToArtist => this.navigate(Page::Artist(artist.clone()), cx),
+                _ => this.tracks_action(action, &tracks, cx),
+            },
+            cx,
+        )
+    }
+
+    fn render_artist_list(
+        &mut self,
+        snap: &Arc<LibrarySnapshot>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let snap = snap.clone();
+        uniform_list(
+            "artists",
+            snap.artists.len(),
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                range
+                    .map(|idx| {
+                        let (name, albums) = &snap.artists[idx];
+                        this.artist_row(idx, name, albums, cx)
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
+    }
+
+    fn artist_row(
+        &self,
+        idx: usize,
+        name: &str,
+        albums: &[Album],
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let theme = cx.omarchy().clone();
+        let song_count: usize = albums.iter().map(|a| a.tracks.len()).sum();
+        let an = albums.len();
+        let label = format!(
+            "{name} · {an} album{} · {song_count} songs",
+            if an == 1 { "" } else { "s" }
+        );
+        let aname = name.to_string();
+        let tracks: Vec<Track> = albums
+            .iter()
+            .flat_map(|a| a.tracks.iter().cloned())
+            .collect();
+        let row = div()
+            .id(("artist", idx))
+            .flex()
+            .items_center()
+            .gap(rems(0.5))
+            .px(rems(0.75))
+            .py(rems(0.5))
+            .border_b_1()
+            .border_color(theme.border)
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .child(self.cover(albums.first().map(|a| a.id.as_str()), 40., name, cx))
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.navigate(Page::Artist(aname.clone()), cx)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(label),
+            );
+        Self::context_menu(
+            ("artist-menu", idx),
+            row,
+            ARTIST_ACTIONS,
+            move |this, action, cx| this.tracks_action(action, &tracks, cx),
+            cx,
+        )
+        .w_full()
     }
 
     fn render_song_list(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.omarchy().clone();
         let tracks = snap.filtered_tracks.clone();
-        div()
-            .id("songs-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
+        uniform_list(
+            "songs",
+            tracks.len(),
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                range
+                    .map(|i| this.song_row(i, &tracks, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
+    }
+
+    fn song_row(&self, i: usize, tracks: &Arc<[Track]>, cx: &mut Context<Self>) -> Popover {
+        let theme = cx.omarchy().clone();
+        let t = &tracks[i];
+        let bg = if i.is_multiple_of(2) {
+            theme.background
+        } else {
+            theme.hover_fill()
+        };
+        let cell = |width: f32, text: String| {
+            div()
+                .w(rems(width))
+                .text_size(rems(0.6875))
+                .text_color(theme.secondary)
+                .truncate()
+                .child(text)
+        };
+        let row = div()
+            .id(("song", i))
+            .flex()
+            .items_center()
+            .gap(rems(0.75))
+            .px(rems(0.75))
+            .py(rems(0.375))
+            .bg(bg)
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .child(cell(2., format!("{}", i + 1)))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .children(tracks.iter().take(800).enumerate().map(|(i, t)| {
-                        let bg = if i % 2 == 0 {
-                            theme.background
-                        } else {
-                            theme.hover_fill()
-                        };
-                        let row = div()
-                            .id(("song", i))
-                            .flex()
-                            .items_center()
-                            .gap(rems(0.75))
-                            .px(rems(0.75))
-                            .py(rems(0.375))
-                            .bg(bg)
-                            .hover(|s| s.bg(theme.hover_fill()))
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .w(rems(2.))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(format!("{}", i + 1)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(rems(0.75))
-                                    .text_color(theme.foreground)
-                                    .child(t.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w(rems(10.))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(t.artist.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w(rems(10.))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(t.album.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w(rems(3.))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(format_time(t.duration)),
-                            );
-                        self.track_row("song", i, tracks.clone(), false, row, cx)
-                    })),
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(t.title.clone()),
             )
-            .into_any_element()
+            .child(cell(10., t.artist.clone()))
+            .child(cell(10., t.album.clone()))
+            .child(cell(3., format_time(t.duration)));
+        self.track_row("song", i, tracks.clone(), false, row, cx)
     }
 
     fn render_album_detail(&mut self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
@@ -1208,72 +1233,84 @@ impl Omamusic {
                     ),
             )
             .child(
-                div()
-                    .id("queue-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .children(queue.iter().enumerate().map(|(i, t)| {
-                                let is_current = index == Some(i);
-                                let past = index.is_some_and(|current| i < current);
-                                let number = if is_current {
-                                    icon(if playing {
-                                        IconName::Volume2
-                                    } else {
-                                        IconName::Volume
-                                    })
-                                    .size(rems(0.875))
-                                    .text_color(theme.accent)
-                                    .into_any_element()
-                                } else {
-                                    (i + 1).to_string().into_any_element()
-                                };
-                                let row = div()
-                                    .id(("queue-row", i))
-                                    .flex()
-                                    .items_center()
-                                    .gap(rems(0.75))
-                                    .px(rems(0.75))
-                                    .py(rems(0.375))
-                                    .text_size(rems(0.75))
-                                    .text_color(if past {
-                                        theme.secondary
-                                    } else {
-                                        theme.foreground
-                                    })
-                                    .hover(|s| s.bg(theme.hover_fill()))
-                                    .cursor_pointer()
-                                    .child(
-                                        div()
-                                            .w(rems(2.))
-                                            .flex()
-                                            .justify_end()
-                                            .text_color(theme.secondary)
-                                            .child(number),
-                                    )
-                                    .child(self.cover(Some(&t.album_id), 28., &t.album, cx))
-                                    .child(div().flex_1().min_w_0().child(t.title.clone()))
-                                    .child(
-                                        div()
-                                            .w(rems(10.))
-                                            .text_color(theme.secondary)
-                                            .child(t.artist.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(rems(3.))
-                                            .text_color(theme.secondary)
-                                            .child(format_time(t.duration)),
-                                    );
-                                self.track_row("queue-menu", i, queue.clone(), true, row, cx)
-                            })),
-                    ),
+                uniform_list(
+                    "queue",
+                    queue.len(),
+                    cx.processor(move |this, range: Range<usize>, _, cx| {
+                        range
+                            .map(|i| this.queue_row(i, &queue, index, playing, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
+    }
+
+    fn queue_row(
+        &self,
+        i: usize,
+        queue: &Arc<[Track]>,
+        index: Option<usize>,
+        playing: bool,
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let theme = cx.omarchy().clone();
+        let t = &queue[i];
+        let is_current = index == Some(i);
+        let past = index.is_some_and(|current| i < current);
+        let number = if is_current {
+            icon(if playing {
+                IconName::Volume2
+            } else {
+                IconName::Volume
+            })
+            .size(rems(0.875))
+            .text_color(theme.accent)
+            .into_any_element()
+        } else {
+            (i + 1).to_string().into_any_element()
+        };
+        let row = div()
+            .id(("queue-row", i))
+            .flex()
+            .items_center()
+            .gap(rems(0.75))
+            .px(rems(0.75))
+            .py(rems(0.375))
+            .text_size(rems(0.75))
+            .text_color(if past {
+                theme.secondary
+            } else {
+                theme.foreground
+            })
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .child(
+                div()
+                    .w(rems(2.))
+                    .flex()
+                    .justify_end()
+                    .text_color(theme.secondary)
+                    .child(number),
+            )
+            .child(self.cover(Some(&t.album_id), 28., &t.album, cx))
+            .child(div().flex_1().min_w_0().truncate().child(t.title.clone()))
+            .child(
+                div()
+                    .w(rems(10.))
+                    .text_color(theme.secondary)
+                    .truncate()
+                    .child(t.artist.clone()),
+            )
+            .child(
+                div()
+                    .w(rems(3.))
+                    .text_color(theme.secondary)
+                    .child(format_time(t.duration)),
+            );
+        self.track_row("queue-menu", i, queue.clone(), true, row, cx)
     }
 
     fn render_player_bar(

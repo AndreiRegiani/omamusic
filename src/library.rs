@@ -17,7 +17,7 @@ use std::time::Duration;
 pub struct LibrarySnapshot {
     pub folders: Vec<PathBuf>,
     pub albums: Vec<Album>,
-    pub filtered_albums: Vec<Album>,
+    pub filtered_albums: Arc<[Album]>,
     pub all_tracks: Arc<[Track]>,
     pub filtered_tracks: Arc<[Track]>,
     pub artists: Vec<(String, Vec<Album>)>,
@@ -171,7 +171,7 @@ impl Library {
 
     fn apply_search(s: &mut LibrarySnapshot) {
         if s.query.trim().is_empty() {
-            s.filtered_albums = s.albums.clone();
+            s.filtered_albums = s.albums.as_slice().into();
             s.filtered_tracks = s.all_tracks.clone();
         } else {
             let search = FuzzySearch::new(&s.query);
@@ -180,7 +180,8 @@ impl Library {
                     .score(&a.title)
                     .max(search.score(&a.artist))
                     .max(search.score(&a.track_titles))
-            });
+            })
+            .into();
             s.filtered_tracks = rank(&s.all_tracks, 500, |t| {
                 search
                     .score(&t.title)
@@ -191,7 +192,7 @@ impl Library {
         }
 
         let mut map: HashMap<String, Vec<Album>> = HashMap::new();
-        for a in &s.filtered_albums {
+        for a in s.filtered_albums.iter() {
             map.entry(a.artist.clone()).or_default().push(a.clone());
         }
         let mut artists: Vec<_> = map
