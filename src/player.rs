@@ -18,9 +18,11 @@ use std::time::Duration;
 
 type AudioSource = UniformSourceIterator<Decoder<BufReader<File>>>;
 
+const PULSE_FRAMES: u32 = 1024;
+
 #[derive(Default)]
 struct Playback {
-    queue: Vec<Track>,
+    queue: Arc<[Track]>,
     order: Vec<Track>,
     index: usize,
     state: PlayerState,
@@ -49,8 +51,20 @@ impl AudioBuffer {
 struct Shared {
     playback: Mutex<Playback>,
     audio: Mutex<AudioBuffer>,
+    listeners: Mutex<Vec<async_channel::Sender<()>>>,
     channels: usize,
     sample_rate: u32,
+}
+
+impl Shared {
+    fn changed(&self) {
+        self.listeners.lock().retain(|listener| {
+            !matches!(
+                listener.try_send(()),
+                Err(async_channel::TrySendError::Closed(_))
+            )
+        });
+    }
 }
 
 enum Command {
@@ -85,6 +99,12 @@ fn following(index: usize, len: usize, repeat: RepeatMode, manual: bool) -> Opti
     }
 }
 
+fn edit(queue: &mut Arc<[Track]>, change: impl FnOnce(&mut Vec<Track>)) {
+    let mut tracks = queue.to_vec();
+    change(&mut tracks);
+    *queue = tracks.into();
+}
+
 fn select(playback: &mut Playback, index: usize) -> Option<Track> {
     playback.index = index;
     let track = playback.queue.get(index)?.clone();
@@ -107,7 +127,9 @@ fn insert(playback: &mut Playback, tracks: Vec<Track>, next: bool) {
         (playback.queue.len(), playback.order.len())
     };
     let at = at.min(playback.queue.len());
-    playback.queue.splice(at..at, tracks.iter().cloned());
+    edit(&mut playback.queue, |queue| {
+        queue.splice(at..at, tracks.iter().cloned());
+    });
     playback.order.splice(order_at..order_at, tracks);
 }
 
@@ -115,11 +137,12 @@ fn remove(playback: &mut Playback, indices: &[usize]) {
     let mut indices = indices.to_vec();
     indices.sort_unstable_by(|a, b| b.cmp(a));
     indices.dedup();
+    let mut queue = playback.queue.to_vec();
     for i in indices {
-        if i == playback.index || i >= playback.queue.len() {
+        if i == playback.index || i >= queue.len() {
             continue;
         }
-        let track = playback.queue.remove(i);
+        let track = queue.remove(i);
         if i < playback.index {
             playback.index -= 1;
         }
@@ -127,6 +150,7 @@ fn remove(playback: &mut Playback, indices: &[usize]) {
             playback.order.remove(pos);
         }
     }
+    playback.queue = queue.into();
 }
 
 fn stop(playback: &mut Playback) {
@@ -224,6 +248,7 @@ fn apply_command(
         }
         Command::Shutdown => return false,
     }
+    shared.changed();
     true
 }
 
@@ -266,6 +291,7 @@ fn run_decoder(shared: Arc<Shared>, commands: Receiver<Command>) {
                 };
                 source = next.and_then(|track| load_source(&shared, track));
                 end_of_file = false;
+                shared.changed();
                 continue;
             }
         }
@@ -290,13 +316,15 @@ fn run_decoder(shared: Arc<Shared>, commands: Receiver<Command>) {
 
 impl Player {
     pub fn new(volume: f64) -> Result<Self> {
-        let preferred = cpal::default_host().id();
-        let mut hosts = vec![preferred];
-        hosts.extend(
-            cpal::available_hosts()
-                .into_iter()
-                .filter(|id| *id != preferred),
-        );
+        let mut hosts = Vec::new();
+        for id in [cpal::HostId::Alsa, cpal::default_host().id()]
+            .into_iter()
+            .chain(cpal::available_hosts())
+        {
+            if !hosts.contains(&id) {
+                hosts.push(id);
+            }
+        }
         let mut failures = Vec::new();
         for id in hosts {
             let Ok(host) = cpal::host_from_id(id) else {
@@ -306,7 +334,7 @@ impl Player {
                 failures.push(format!("{id}: no default output device"));
                 continue;
             };
-            match Self::from_device(&device, volume) {
+            match Self::from_device(&device, id, volume) {
                 Ok(player) => return Ok(player),
                 Err(err) => failures.push(format!("{id}: {err:#}")),
             }
@@ -314,7 +342,7 @@ impl Player {
         anyhow::bail!("no usable audio output: {}", failures.join("; "))
     }
 
-    fn from_device(device: &cpal::Device, volume: f64) -> Result<Self> {
+    fn from_device(device: &cpal::Device, host: cpal::HostId, volume: f64) -> Result<Self> {
         let mut supported = device
             .default_output_config()
             .context("query audio output")?;
@@ -331,7 +359,12 @@ impl Player {
                 .context("no supported PCM audio format")?
                 .with_sample_rate(48_000);
         }
-        let config = supported.config();
+        let mut config = supported.config();
+        if let cpal::SupportedBufferSize::Range { min, max } = supported.buffer_size() {
+            if host == cpal::HostId::PulseAudio {
+                config.buffer_size = cpal::BufferSize::Fixed(PULSE_FRAMES.clamp(*min, *max));
+            }
+        }
         if config.channels == 0 || config.sample_rate == 0 {
             anyhow::bail!("audio device reported an invalid stream configuration");
         }
@@ -358,6 +391,7 @@ impl Player {
                 ..Default::default()
             }),
             audio: Mutex::new(AudioBuffer::default()),
+            listeners: Mutex::new(Vec::new()),
             channels: channels as usize,
             sample_rate,
         });
@@ -383,19 +417,27 @@ impl Player {
         let track = {
             let mut p = self.shared.playback.lock();
             p.order = tracks.clone();
-            p.queue = tracks;
-            let start = at.min(p.queue.len() - 1);
+            let mut queue = tracks;
+            let start = at.min(queue.len() - 1);
             let index = if p.shuffle {
-                let first = p.queue.remove(start);
-                p.queue.shuffle(&mut rand::thread_rng());
-                p.queue.insert(0, first);
+                let first = queue.remove(start);
+                queue.shuffle(&mut rand::thread_rng());
+                queue.insert(0, first);
                 0
             } else {
                 start
             };
+            p.queue = queue.into();
             select(&mut p, index)
         };
         self.load(track);
+        self.shared.changed();
+    }
+
+    pub fn subscribe(&self) -> async_channel::Receiver<()> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.shared.listeners.lock().push(sender);
+        receiver
     }
 
     pub fn play_next(&self, tracks: Vec<Track>) {
@@ -417,18 +459,22 @@ impl Player {
             return;
         }
         insert(&mut p, tracks, next);
+        drop(p);
+        self.shared.changed();
     }
 
     pub fn remove(&self, indices: &[usize]) {
         remove(&mut self.shared.playback.lock(), indices);
+        self.shared.changed();
     }
 
     pub fn jump(&self, index: usize) {
         let track = select(&mut self.shared.playback.lock(), index);
         self.load(track);
+        self.shared.changed();
     }
 
-    pub fn queue(&self) -> (Vec<Track>, Option<usize>) {
+    pub fn queue(&self) -> (Arc<[Track]>, Option<usize>) {
         let p = self.shared.playback.lock();
         (p.queue.clone(), p.current.is_some().then_some(p.index))
     }
@@ -454,6 +500,8 @@ impl Player {
         if p.current.is_some() {
             p.state = PlayerState::Playing;
         }
+        drop(p);
+        self.shared.changed();
     }
 
     pub fn pause(&self) {
@@ -461,14 +509,18 @@ impl Player {
         if p.current.is_some() {
             p.state = PlayerState::Paused;
         }
+        drop(p);
+        self.shared.changed();
     }
 
     pub fn stop(&self) {
         let mut p = self.shared.playback.lock();
         stop(&mut p);
-        p.queue.clear();
+        p.queue = Arc::new([]);
         p.order.clear();
         let _ = self.commands.send(Command::Clear);
+        drop(p);
+        self.shared.changed();
     }
 
     pub fn next(&self) {
@@ -480,6 +532,7 @@ impl Player {
         if !self.load(track) {
             self.stop();
         }
+        self.shared.changed();
     }
 
     pub fn previous(&self) {
@@ -496,6 +549,7 @@ impl Player {
         if !self.load(track) {
             self.seek(0.0);
         }
+        self.shared.changed();
     }
 
     pub fn seek(&self, secs: f64) {
@@ -517,12 +571,14 @@ impl Player {
         p.shuffle = enabled;
         if let Some(current) = p.current.clone() {
             if enabled {
-                p.queue.retain(|track| track.path != current.path);
-                p.queue.shuffle(&mut rand::thread_rng());
-                p.queue.insert(0, current);
+                edit(&mut p.queue, |queue| {
+                    queue.retain(|track| track.path != current.path);
+                    queue.shuffle(&mut rand::thread_rng());
+                    queue.insert(0, current);
+                });
                 p.index = 0;
             } else {
-                p.queue = p.order.clone();
+                p.queue = p.order.as_slice().into();
                 p.index = p
                     .order
                     .iter()
@@ -530,12 +586,15 @@ impl Player {
                     .unwrap_or(0);
             }
         }
+        drop(p);
+        self.shared.changed();
     }
     pub fn shuffle(&self) -> bool {
         self.shared.playback.lock().shuffle
     }
     pub fn set_repeat(&self, mode: RepeatMode) {
         self.shared.playback.lock().repeat = mode;
+        self.shared.changed();
     }
     pub fn repeat(&self) -> RepeatMode {
         self.shared.playback.lock().repeat
@@ -625,7 +684,7 @@ mod tests {
         Playback {
             current: queue.get(index).cloned(),
             order: order.iter().map(|n| named(n)).collect(),
-            queue,
+            queue: queue.into(),
             index,
             ..Default::default()
         }

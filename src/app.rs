@@ -1,43 +1,38 @@
 use crate::config::AppConfig;
 use crate::library::{Library, LibrarySnapshot};
-use crate::models::{Album, PlayerState, RepeatMode, Section, Track};
+use crate::models::{Album, PlayerState, Section, Track};
 use crate::player::Player;
 use crate::{FocusSearch, GoBack};
 use gpui_kit::base::input::InputState;
-use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, rems, AnyElement, App, AppContext, ClickEvent, Context, Div, ElementId, Entity,
-    ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
-    PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
+    div, px, rems, uniform_list, AnyElement, App, AppContext, ClickEvent, Context, Div, ElementId,
+    Entity, ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection,
+    ParentElement, PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
-    separator, slider, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName, MenuItem,
+    separator, switch, with_tooltip, ActiveTheme, ButtonVariant, IconName, MenuItem,
 };
 use rand::Rng;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-
-const PROGRESS_STEPS: f32 = 1000.;
 
 pub struct Omamusic {
     pub library: Arc<Library>,
     pub player: Arc<Player>,
     section: Section,
     query: Entity<InputState>,
-    volume: Entity<SliderState>,
-    progress_state: Entity<SliderState>,
     pages: Vec<Page>,
     selection: BTreeSet<usize>,
     anchor: Option<usize>,
     show_settings: bool,
     lib_version: u64,
-    was_playing: bool,
-    seeking: bool,
+    prefs: AppConfig,
     new_folder: Entity<InputState>,
 }
 
@@ -120,11 +115,25 @@ impl Selectable for MenuTrigger {
     }
 }
 
+pub fn cover(
+    library: &Library,
+    album_id: Option<&str>,
+    size: f32,
+    name: &str,
+    cx: &App,
+) -> impl IntoElement {
+    let cover = avatar(initials(name), cx).size(px(size));
+    match album_id.and_then(|id| library.covers().cached(id, size as u32 * 2)) {
+        Some(image) => cover.image(avatar_image(ImageSource::Image(image))),
+        None => cover,
+    }
+}
+
 fn initials(text: &str) -> String {
     text.chars().take(2).collect()
 }
 
-fn format_time(secs: f64) -> String {
+pub fn format_time(secs: f64) -> String {
     if !secs.is_finite() || secs <= 0.0 {
         return "0:00".into();
     }
@@ -147,22 +156,6 @@ impl Omamusic {
     ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
         let new_folder = cx.new(|cx| InputState::new(window, cx).placeholder("Enter folder path"));
-        let vol = player.volume() as f32;
-        let volume = cx.new(|_| {
-            SliderState::new()
-                .min(0.)
-                .max(1.)
-                .step(0.01)
-                .default_value(vol)
-        });
-        let progress_state = cx.new(|_| {
-            SliderState::new()
-                .min(0.)
-                .max(PROGRESS_STEPS)
-                .step(1.)
-                .default_value(0.)
-        });
-
         cx.observe(&query, |this, state, cx| {
             let text = state.read(cx).text().to_string();
             this.library.set_query(text);
@@ -172,38 +165,34 @@ impl Omamusic {
         })
         .detach();
 
-        cx.subscribe(&volume, |this, _, event: &SliderEvent, _| match event {
-            SliderEvent::Change(value) => this.player.set_volume(value.end() as f64),
-            SliderEvent::Release(_) => {
-                let volume = this.player.volume();
-                AppConfig::update(|c| c.volume = volume);
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let alive = this.update(cx, |this, cx| this.tick(false, cx)).is_ok();
+            if !alive {
+                break;
             }
         })
         .detach();
 
-        cx.subscribe(
-            &progress_state,
-            |this, _, event: &SliderEvent, _| match event {
-                SliderEvent::Change(_) => this.seeking = true,
-                SliderEvent::Release(value) => {
-                    this.seeking = false;
-                    let dur = this.player.duration().max(1.0);
-                    this.player
-                        .seek(value.end() as f64 / PROGRESS_STEPS as f64 * dur);
+        let changes = player.subscribe();
+        cx.spawn(async move |this, cx| {
+            while changes.recv().await.is_ok() {
+                let alive = this.update(cx, |this, cx| this.tick(true, cx)).is_ok();
+                if !alive {
+                    break;
                 }
-            },
-        )
+            }
+        })
         .detach();
 
-        cx.spawn_in(window, async move |this, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(500))
-                .await;
-            let alive = this
-                .update_in(cx, |this, window, cx| this.tick(window, cx))
-                .is_ok();
-            if !alive {
-                break;
+        let covers = library.covers().subscribe();
+        cx.spawn(async move |this, cx| {
+            while covers.recv().await.is_ok() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
             }
         })
         .detach();
@@ -230,63 +219,34 @@ impl Omamusic {
             player,
             section,
             query,
-            volume,
-            progress_state,
             pages,
             selection: BTreeSet::new(),
             anchor: None,
             show_settings,
             lib_version: 0,
-            was_playing: false,
-            seeking: false,
+            prefs: AppConfig::load(),
             new_folder,
         }
     }
 
-    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn tick(&mut self, force: bool, cx: &mut Context<Self>) {
         let version = self.library.version();
-        let playing = self.player.state() == PlayerState::Playing;
-        if version == self.lib_version && !playing && !self.was_playing {
+        if !force && version == self.lib_version {
             return;
         }
         if version != self.lib_version {
             self.clear_selection();
         }
         self.lib_version = version;
-        self.was_playing = playing;
-        if !self.seeking {
-            let dur = self.player.duration().max(1.0) as f32;
-            let value =
-                (self.player.position() as f32 / dur * PROGRESS_STEPS).clamp(0., PROGRESS_STEPS);
-            self.progress_state
-                .update(cx, |s, cx| s.set_value(value, window, cx));
-        }
         cx.notify();
     }
 
-    fn cover(&self, album_id: Option<&str>, size: f32, name: &str, cx: &App) -> impl IntoElement {
-        let cover = avatar(initials(name), cx).size(px(size));
-        match album_id.and_then(|id| self.library.covers().thumbnail(id, size as u32 * 2)) {
-            Some(image) => cover.image(avatar_image(ImageSource::Image(image))),
-            None => cover,
-        }
+    pub fn show_album(&mut self, album_id: String, cx: &mut Context<Self>) {
+        self.navigate(Page::Album(album_id), cx);
     }
 
-    fn control_button(
-        id: &'static str,
-        icon_name: IconName,
-        label: &'static str,
-        variant: ButtonVariant,
-        disabled: bool,
-        action: fn(&Player),
-        cx: &mut Context<Self>,
-    ) -> Button {
-        icon_button(id, icon_name, label, variant, cx)
-            .disabled(disabled)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                action(&this.player);
-                cx.notify();
-            }))
+    fn cover(&self, album_id: Option<&str>, size: f32, name: &str, cx: &App) -> impl IntoElement {
+        cover(&self.library, album_id, size, name, cx)
     }
 
     fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
@@ -462,6 +422,25 @@ impl Omamusic {
         });
     }
 
+    fn pref_switch(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        checked: bool,
+        change: fn(&mut AppConfig, bool),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        switch(id, label, checked, cx).on_change(move |on, _, _, cx| {
+            let _ = this.update(cx, |this, cx| {
+                change(&mut this.prefs, on);
+                AppConfig::update(|c| change(c, on));
+                crate::desktop::set_cover_icon(!this.prefs.plain_tray_icon);
+                cx.notify();
+            });
+        })
+    }
+
     fn browse_folder(&mut self, cx: &mut Context<Self>) {
         let path = self.new_folder.read(cx).text().to_string();
         if !path.is_empty() {
@@ -524,8 +503,6 @@ fn sidebar_btn(
 impl Render for Omamusic {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snap = self.library.snapshot();
-        let current = self.player.current();
-        let playing = self.player.state() == PlayerState::Playing;
         let theme = cx.omarchy().clone();
         let nav = [
             ("nav-albums", "Albums", IconName::Disc3, Section::Albums),
@@ -683,13 +660,11 @@ impl Render for Omamusic {
                                             )
                                             .into_any_element()
                                         } else {
-                                            self.render_content(&snap, cx)
+                                            self.render_content(&snap, window, cx)
                                         },
                                     ),
                             ),
                     )
-                    .child(separator(cx))
-                    .child(self.render_player_bar(current.as_ref(), playing, window, cx))
                     .when(self.show_settings, |d| {
                         d.child(self.render_settings(&snap, window, cx))
                     }),
@@ -698,18 +673,25 @@ impl Render for Omamusic {
 }
 
 impl Omamusic {
-    fn render_content(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
+    fn render_content(
+        &mut self,
+        snap: &Arc<LibrarySnapshot>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match self.pages.last().cloned() {
             Some(Page::Album(id)) => {
                 if let Some(album) = snap.albums.iter().find(|a| a.id == id) {
                     return self.render_album_detail(album, cx);
                 }
             }
-            Some(Page::Artist(name)) => return self.render_artist_albums(&name, snap, cx),
+            Some(Page::Artist(name)) => return self.render_artist_albums(&name, snap, window, cx),
             None => {}
         }
         match self.section {
-            Section::Albums => self.render_album_grid(&snap.filtered_albums, cx),
+            Section::Albums => {
+                self.render_album_grid("albums", snap.filtered_albums.clone(), window, cx)
+            }
             Section::Artists => self.render_artist_list(snap, cx),
             Section::Songs => self.render_song_list(snap, cx),
             Section::Queue => self.render_queue(cx),
@@ -720,10 +702,11 @@ impl Omamusic {
         &mut self,
         name: &str,
         snap: &LibrarySnapshot,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.omarchy().clone();
-        let albums: Vec<Album> = snap
+        let albums: Arc<[Album]> = snap
             .albums
             .iter()
             .filter(|a| a.artist == name || a.tracks.iter().any(|t| t.artist == name))
@@ -752,212 +735,228 @@ impl Omamusic {
                             .child(name.to_string()),
                     ),
             )
-            .child(self.render_album_grid(&albums, cx))
+            .child(self.render_album_grid("artist-albums", albums, window, cx))
             .into_any_element()
     }
 
-    fn render_album_grid(&mut self, albums: &[Album], cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.omarchy().clone();
-        div()
-            .id("albums-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p(rems(0.75))
-            .child(div().flex().flex_wrap().gap(rems(0.75)).children(
-                albums.iter().take(400).enumerate().map(|(idx, a)| {
-                    let id = a.id.clone();
-                    let tracks = a.tracks.clone();
-                    let n = a.tracks.len();
-                    let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
-                    let artist = a.artist.clone();
-                    let card = div()
-                        .id(("album", idx))
-                        .w(rems(10.))
-                        .min_w(rems(8.))
-                        .flex()
-                        .flex_col()
-                        .gap(rems(0.375))
-                        .p(rems(0.5))
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.background)
-                        .hover(|s| s.bg(theme.hover_fill()))
-                        .cursor_pointer()
-                        .child(self.cover(Some(&a.id), 128., &a.title, cx))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.navigate(Page::Album(id.clone()), cx)
-                        }))
-                        .child(
-                            div()
-                                .text_size(rems(0.75))
-                                .text_color(theme.foreground)
-                                .child(a.title.clone()),
+    fn render_album_grid(
+        &mut self,
+        id: &'static str,
+        albums: Arc<[Album]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rem = window.rem_size();
+        let gap = rem * 0.75;
+        let width = window.viewport_size().width - rem * 11. - px(1.) - gap * 2.;
+        let columns = (((width + gap) / (rem * 10. + gap)).floor() as usize).max(1);
+        let rows = albums.len().div_ceil(columns);
+        uniform_list(
+            id,
+            rows,
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                range
+                    .map(|row| {
+                        let start = row * columns;
+                        let end = (start + columns).min(albums.len());
+                        div().flex().gap(gap).px(gap).pt(gap).children(
+                            (start..end).map(|idx| this.album_card(&albums[idx], idx, cx)),
                         )
-                        .child(
-                            div()
-                                .text_size(rems(0.6875))
-                                .text_color(theme.secondary)
-                                .child(a.artist.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(rems(0.6875))
-                                .text_color(theme.secondary)
-                                .child(count),
-                        );
-                    Self::context_menu(
-                        ("album-menu", idx),
-                        card,
-                        ALBUM_ACTIONS,
-                        move |this, action, cx| match action {
-                            RowAction::GoToArtist => {
-                                this.navigate(Page::Artist(artist.clone()), cx)
-                            }
-                            _ => this.tracks_action(action, &tracks, cx),
-                        },
-                        cx,
-                    )
-                }),
-            ))
-            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .pb(gap)
+        .into_any_element()
     }
 
-    fn render_artist_list(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
+    fn album_card(&self, a: &Album, idx: usize, cx: &mut Context<Self>) -> Popover {
         let theme = cx.omarchy().clone();
-        div()
-            .id("artists-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
+        let id = a.id.clone();
+        let tracks = a.tracks.clone();
+        let n = a.tracks.len();
+        let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
+        let artist = a.artist.clone();
+        let card = div()
+            .id(("album", idx))
+            .w(rems(10.))
+            .flex()
+            .flex_col()
+            .gap(rems(0.375))
+            .p(rems(0.5))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .child(self.cover(Some(&a.id), 128., &a.title, cx))
+            .on_click(cx.listener(move |this, _, _, cx| this.navigate(Page::Album(id.clone()), cx)))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .children(
-                        snap.artists
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, (name, albums))| {
-                                let song_count: usize = albums.iter().map(|a| a.tracks.len()).sum();
-                                let an = albums.len();
-                                let label = format!(
-                                    "{name} · {an} album{} · {song_count} songs",
-                                    if an == 1 { "" } else { "s" }
-                                );
-                                let aname = name.clone();
-                                let tracks: Vec<Track> = albums
-                                    .iter()
-                                    .flat_map(|a| a.tracks.iter().cloned())
-                                    .collect();
-                                let row = div()
-                                    .id(("artist", idx))
-                                    .flex()
-                                    .items_center()
-                                    .gap(rems(0.5))
-                                    .px(rems(0.75))
-                                    .py(rems(0.5))
-                                    .border_b_1()
-                                    .border_color(theme.border)
-                                    .hover(|s| s.bg(theme.hover_fill()))
-                                    .cursor_pointer()
-                                    .child(self.cover(
-                                        albums.first().map(|a| a.id.as_str()),
-                                        40.,
-                                        name,
-                                        cx,
-                                    ))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.navigate(Page::Artist(aname.clone()), cx)
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_size(rems(0.75))
-                                            .text_color(theme.foreground)
-                                            .child(label),
-                                    );
-                                Self::context_menu(
-                                    ("artist-menu", idx),
-                                    row,
-                                    ARTIST_ACTIONS,
-                                    move |this, action, cx| this.tracks_action(action, &tracks, cx),
-                                    cx,
-                                )
-                                .w_full()
-                            }),
-                    ),
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(a.title.clone()),
             )
-            .into_any_element()
+            .child(
+                div()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .truncate()
+                    .child(a.artist.clone()),
+            )
+            .child(
+                div()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .child(count),
+            );
+        Self::context_menu(
+            ("album-menu", idx),
+            card,
+            ALBUM_ACTIONS,
+            move |this, action, cx| match action {
+                RowAction::GoToArtist => this.navigate(Page::Artist(artist.clone()), cx),
+                _ => this.tracks_action(action, &tracks, cx),
+            },
+            cx,
+        )
+    }
+
+    fn render_artist_list(
+        &mut self,
+        snap: &Arc<LibrarySnapshot>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let snap = snap.clone();
+        uniform_list(
+            "artists",
+            snap.artists.len(),
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                range
+                    .map(|idx| {
+                        let (name, albums) = &snap.artists[idx];
+                        this.artist_row(idx, name, albums, cx)
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
+    }
+
+    fn artist_row(
+        &self,
+        idx: usize,
+        name: &str,
+        albums: &[Album],
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let theme = cx.omarchy().clone();
+        let song_count: usize = albums.iter().map(|a| a.tracks.len()).sum();
+        let an = albums.len();
+        let label = format!(
+            "{name} · {an} album{} · {song_count} songs",
+            if an == 1 { "" } else { "s" }
+        );
+        let aname = name.to_string();
+        let tracks: Vec<Track> = albums
+            .iter()
+            .flat_map(|a| a.tracks.iter().cloned())
+            .collect();
+        let row = div()
+            .id(("artist", idx))
+            .flex()
+            .items_center()
+            .gap(rems(0.5))
+            .px(rems(0.75))
+            .py(rems(0.5))
+            .border_b_1()
+            .border_color(theme.border)
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .child(self.cover(albums.first().map(|a| a.id.as_str()), 40., name, cx))
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.navigate(Page::Artist(aname.clone()), cx)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(label),
+            );
+        Self::context_menu(
+            ("artist-menu", idx),
+            row,
+            ARTIST_ACTIONS,
+            move |this, action, cx| this.tracks_action(action, &tracks, cx),
+            cx,
+        )
+        .w_full()
     }
 
     fn render_song_list(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.omarchy().clone();
         let tracks = snap.filtered_tracks.clone();
-        div()
-            .id("songs-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
+        uniform_list(
+            "songs",
+            tracks.len(),
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                range
+                    .map(|i| this.song_row(i, &tracks, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
+    }
+
+    fn song_row(&self, i: usize, tracks: &Arc<[Track]>, cx: &mut Context<Self>) -> Popover {
+        let theme = cx.omarchy().clone();
+        let t = &tracks[i];
+        let bg = if i.is_multiple_of(2) {
+            theme.background
+        } else {
+            theme.hover_fill()
+        };
+        let cell = |width: f32, text: String| {
+            div()
+                .w(rems(width))
+                .text_size(rems(0.6875))
+                .text_color(theme.secondary)
+                .truncate()
+                .child(text)
+        };
+        let row = div()
+            .id(("song", i))
+            .flex()
+            .items_center()
+            .gap(rems(0.75))
+            .px(rems(0.75))
+            .py(rems(0.375))
+            .bg(bg)
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .child(cell(2., format!("{}", i + 1)))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .children(tracks.iter().take(800).enumerate().map(|(i, t)| {
-                        let bg = if i % 2 == 0 {
-                            theme.background
-                        } else {
-                            theme.hover_fill()
-                        };
-                        let row = div()
-                            .id(("song", i))
-                            .flex()
-                            .items_center()
-                            .gap(rems(0.75))
-                            .px(rems(0.75))
-                            .py(rems(0.375))
-                            .bg(bg)
-                            .hover(|s| s.bg(theme.hover_fill()))
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .w(rems(2.))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(format!("{}", i + 1)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(rems(0.75))
-                                    .text_color(theme.foreground)
-                                    .child(t.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w(rems(10.))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(t.artist.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w(rems(10.))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(t.album.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w(rems(3.))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(format_time(t.duration)),
-                            );
-                        self.track_row("song", i, tracks.clone(), false, row, cx)
-                    })),
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(t.title.clone()),
             )
-            .into_any_element()
+            .child(cell(10., t.artist.clone()))
+            .child(cell(10., t.album.clone()))
+            .child(cell(3., format_time(t.duration)));
+        self.track_row("song", i, tracks.clone(), false, row, cx)
     }
 
     fn render_album_detail(&mut self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
@@ -1149,7 +1148,6 @@ impl Omamusic {
             .into_any_element();
         }
         let playing = self.player.state() == PlayerState::Playing;
-        let queue: Arc<[Track]> = queue.into();
         div()
             .flex_1()
             .min_h_0()
@@ -1186,266 +1184,84 @@ impl Omamusic {
                     ),
             )
             .child(
-                div()
-                    .id("queue-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .children(queue.iter().enumerate().map(|(i, t)| {
-                                let is_current = index == Some(i);
-                                let past = index.is_some_and(|current| i < current);
-                                let number = if is_current {
-                                    icon(if playing {
-                                        IconName::Volume2
-                                    } else {
-                                        IconName::Volume
-                                    })
-                                    .size(rems(0.875))
-                                    .text_color(theme.accent)
-                                    .into_any_element()
-                                } else {
-                                    (i + 1).to_string().into_any_element()
-                                };
-                                let row = div()
-                                    .id(("queue-row", i))
-                                    .flex()
-                                    .items_center()
-                                    .gap(rems(0.75))
-                                    .px(rems(0.75))
-                                    .py(rems(0.375))
-                                    .text_size(rems(0.75))
-                                    .text_color(if past {
-                                        theme.secondary
-                                    } else {
-                                        theme.foreground
-                                    })
-                                    .hover(|s| s.bg(theme.hover_fill()))
-                                    .cursor_pointer()
-                                    .child(
-                                        div()
-                                            .w(rems(2.))
-                                            .flex()
-                                            .justify_end()
-                                            .text_color(theme.secondary)
-                                            .child(number),
-                                    )
-                                    .child(self.cover(Some(&t.album_id), 28., &t.album, cx))
-                                    .child(div().flex_1().min_w_0().child(t.title.clone()))
-                                    .child(
-                                        div()
-                                            .w(rems(10.))
-                                            .text_color(theme.secondary)
-                                            .child(t.artist.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(rems(3.))
-                                            .text_color(theme.secondary)
-                                            .child(format_time(t.duration)),
-                                    );
-                                self.track_row("queue-menu", i, queue.clone(), true, row, cx)
-                            })),
-                    ),
+                uniform_list(
+                    "queue",
+                    queue.len(),
+                    cx.processor(move |this, range: Range<usize>, _, cx| {
+                        range
+                            .map(|i| this.queue_row(i, &queue, index, playing, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
     }
 
-    fn render_player_bar(
-        &mut self,
-        current: Option<&Track>,
+    fn queue_row(
+        &self,
+        i: usize,
+        queue: &Arc<[Track]>,
+        index: Option<usize>,
         playing: bool,
-        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Popover {
         let theme = cx.omarchy().clone();
-        let has_track = current.is_some();
-        let pos = if has_track {
-            self.player.position()
-        } else {
-            0.0
-        };
-        let dur = if has_track {
-            self.player.duration().max(1.0)
-        } else {
-            0.0
-        };
-        let title = current
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| "Not Playing".into());
-        let sub = current
-            .map(|t| format!("{} — {}", t.artist, t.album))
-            .unwrap_or_default();
-        let shuffle = self.player.shuffle();
-        let repeat = self.player.repeat();
-        let toggled = |on: bool| {
-            if on {
-                ButtonVariant::Primary
+        let t = &queue[i];
+        let is_current = index == Some(i);
+        let past = index.is_some_and(|current| i < current);
+        let number = if is_current {
+            icon(if playing {
+                IconName::Volume2
             } else {
-                ButtonVariant::Secondary
-            }
+                IconName::Volume
+            })
+            .size(rems(0.875))
+            .text_color(theme.accent)
+            .into_any_element()
+        } else {
+            (i + 1).to_string().into_any_element()
         };
-
-        div()
+        let row = div()
+            .id(("queue-row", i))
             .flex()
-            .flex_wrap()
             .items_center()
             .gap(rems(0.75))
             .px(rems(0.75))
-            .py(rems(0.5))
-            .border_t_1()
-            .border_color(theme.border)
-            .bg(theme.background)
+            .py(rems(0.375))
+            .text_size(rems(0.75))
+            .text_color(if past {
+                theme.secondary
+            } else {
+                theme.foreground
+            })
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
             .child(
                 div()
-                    .id("now-playing")
+                    .w(rems(2.))
                     .flex()
-                    .items_center()
-                    .gap(rems(0.75))
-                    .when(has_track, |d| d.cursor_pointer())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(track) = this.player.current() {
-                            this.navigate(Page::Album(track.album_id), cx);
-                        }
-                    }))
-                    .child(self.cover(
-                        current.map(|t| t.album_id.as_str()),
-                        40.,
-                        current.map_or("♪", |t| t.title.as_str()),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w(rems(10.))
-                            .min_w(rems(6.))
-                            .child(
-                                div()
-                                    .text_size(rems(0.75))
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(sub),
-                            ),
-                    ),
+                    .justify_end()
+                    .text_color(theme.secondary)
+                    .child(number),
+            )
+            .child(self.cover(Some(&t.album_id), 28., &t.album, cx))
+            .child(div().flex_1().min_w_0().truncate().child(t.title.clone()))
+            .child(
+                div()
+                    .w(rems(10.))
+                    .text_color(theme.secondary)
+                    .truncate()
+                    .child(t.artist.clone()),
             )
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(rems(0.375))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "shuffle",
-                            IconName::Shuffle,
-                            "Shuffle",
-                            toggled(shuffle),
-                            !has_track,
-                            |p| p.set_shuffle(!p.shuffle()),
-                            cx,
-                        ),
-                        "Shuffle",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "prev",
-                            IconName::SkipBack,
-                            "Previous",
-                            ButtonVariant::Secondary,
-                            !has_track,
-                            Player::previous,
-                            cx,
-                        ),
-                        "Previous",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "play",
-                            if playing {
-                                IconName::Pause
-                            } else {
-                                IconName::Play
-                            },
-                            if playing { "Pause" } else { "Play" },
-                            ButtonVariant::Primary,
-                            !has_track,
-                            Player::toggle,
-                            cx,
-                        ),
-                        "Play/Pause (Space)",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "next",
-                            IconName::SkipForward,
-                            "Next",
-                            ButtonVariant::Secondary,
-                            !has_track,
-                            Player::next,
-                            cx,
-                        ),
-                        "Next",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "repeat",
-                            if repeat == RepeatMode::One {
-                                IconName::Repeat1
-                            } else {
-                                IconName::Repeat
-                            },
-                            "Repeat",
-                            toggled(repeat != RepeatMode::Off),
-                            !has_track,
-                            |p| p.set_repeat(p.repeat().next()),
-                            cx,
-                        ),
-                        "Repeat",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w(rems(6.))
-                    .items_center()
-                    .gap(rems(0.5))
-                    .child(
-                        div()
-                            .w(rems(3.))
-                            .text_size(rems(0.6875))
-                            .text_color(theme.secondary)
-                            .child(format_time(pos)),
-                    )
-                    .child(div().flex_1().min_w_0().child(slider(
-                        &self.progress_state,
-                        !has_track,
-                        window,
-                        cx,
-                    )))
-                    .child(
-                        div()
-                            .w(rems(3.))
-                            .text_size(rems(0.6875))
-                            .text_color(theme.secondary)
-                            .child(format_time(dur)),
-                    ),
-            )
-            .child(icon(IconName::Volume2).size(rems(0.875)))
-            .child(
-                div()
-                    .w(rems(6.))
-                    .min_w(rems(4.))
-                    .child(slider(&self.volume, false, window, cx)),
-            )
+                    .w(rems(3.))
+                    .text_color(theme.secondary)
+                    .child(format_time(t.duration)),
+            );
+        self.track_row("queue-menu", i, queue.clone(), true, row, cx)
     }
 
     fn render_settings(
@@ -1455,6 +1271,34 @@ impl Omamusic {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         panel("Settings", cx)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.25))
+                    .child(self.pref_switch(
+                        "pref-close-to-tray",
+                        "Close window to tray",
+                        !self.prefs.quit_on_close,
+                        |c, on| c.quit_on_close = !on,
+                        cx,
+                    ))
+                    .child(self.pref_switch(
+                        "pref-tray-cover",
+                        "Use album cover as tray icon",
+                        !self.prefs.plain_tray_icon,
+                        |c, on| c.plain_tray_icon = !on,
+                        cx,
+                    ))
+                    .child(self.pref_switch(
+                        "pref-start-hidden",
+                        "Start hidden in tray",
+                        self.prefs.start_hidden,
+                        |c, on| c.start_hidden = on,
+                        cx,
+                    )),
+            )
+            .child(separator(cx))
             .child(
                 div()
                     .flex()
