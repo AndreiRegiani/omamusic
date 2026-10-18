@@ -18,6 +18,8 @@ use std::time::Duration;
 
 type AudioSource = UniformSourceIterator<Decoder<BufReader<File>>>;
 
+const OUTPUT_FRAMES: u32 = 1024;
+
 #[derive(Default)]
 struct Playback {
     queue: Vec<Track>,
@@ -331,7 +333,10 @@ impl Player {
                 .context("no supported PCM audio format")?
                 .with_sample_rate(48_000);
         }
-        let config = supported.config();
+        let mut config = supported.config();
+        if let cpal::SupportedBufferSize::Range { min, max } = supported.buffer_size() {
+            config.buffer_size = cpal::BufferSize::Fixed(OUTPUT_FRAMES.clamp(*min, *max));
+        }
         if config.channels == 0 || config.sample_rate == 0 {
             anyhow::bail!("audio device reported an invalid stream configuration");
         }
