@@ -2,20 +2,22 @@ use crate::library::Library;
 use crate::models::{PlayerState, Track};
 use crate::player::Player;
 use crate::{mpris, tray};
-use async_channel::Sender;
+use async_channel::{Receiver, Sender};
 use ksni::blocking::TrayMethods;
 use mpris_server::zbus;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 const BUS_NAME: &str = "org.mpris.MediaPlayer2.omamusic";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 
 static COVER_ICON: AtomicBool = AtomicBool::new(true);
+static COVER_ICON_CHANGED: LazyLock<(Sender<()>, Receiver<()>)> =
+    LazyLock::new(|| async_channel::bounded(1));
 
 pub enum Command {
     ToggleWindow,
@@ -40,6 +42,7 @@ pub struct NowPlaying {
 
 pub fn set_cover_icon(enabled: bool) {
     COVER_ICON.store(enabled, Ordering::Relaxed);
+    let _ = COVER_ICON_CHANGED.0.try_send(());
 }
 
 pub fn hash(text: &str) -> u64 {
@@ -122,10 +125,12 @@ async fn sync(
             None
         }
     };
+    let changes = player.subscribe();
+    let cover_icon_changes = COVER_ICON_CHANGED.1.clone();
     let mut now = NowPlaying::default();
     let mut position = 0.0;
+    let mut checked = Instant::now();
     loop {
-        async_io::Timer::after(Duration::from_millis(300)).await;
         let track = player.current();
         let state = player.state();
         let cover_icon = COVER_ICON.load(Ordering::Relaxed);
@@ -137,38 +142,43 @@ async fn sync(
         let previous = position;
         position = player.position();
         let expected = previous
-            + if state == PlayerState::Playing {
-                0.3
+            + if now.state == PlayerState::Playing {
+                checked.elapsed().as_secs_f64()
             } else {
                 0.0
             };
+        checked = Instant::now();
         if let Some(server) = &server {
             if !track_changed && (position - expected).abs() > 1.0 {
                 server.seeked(position).await;
             }
         }
 
-        if !changed {
-            continue;
+        if changed {
+            if album_changed {
+                now.cover = track
+                    .as_ref()
+                    .and_then(|t| cover(&library, &t.album_id))
+                    .map(Arc::new);
+            }
+            now.track = track;
+            now.state = state;
+            now.cover_icon = cover_icon;
+            if let Some(tray) = &tray {
+                let update = now.clone();
+                tray.update(move |tray| tray.now = update);
+            }
+            if let Some(server) = &server {
+                server
+                    .imp()
+                    .set_art(now.cover.as_ref().map(|c| c.url.clone()));
+                server.changed(track_changed).await;
+            }
         }
-        if album_changed {
-            now.cover = track
-                .as_ref()
-                .and_then(|t| cover(&library, &t.album_id))
-                .map(Arc::new);
-        }
-        now.track = track;
-        now.state = state;
-        now.cover_icon = cover_icon;
-        if let Some(tray) = &tray {
-            let update = now.clone();
-            tray.update(move |tray| tray.now = update);
-        }
-        if let Some(server) = &server {
-            server
-                .imp()
-                .set_art(now.cover.as_ref().map(|c| c.url.clone()));
-            server.changed(track_changed).await;
+
+        let woke = futures_lite::future::or(changes.recv(), cover_icon_changes.recv()).await;
+        if woke.is_err() {
+            break;
         }
     }
 }
