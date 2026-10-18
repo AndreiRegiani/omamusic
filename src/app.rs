@@ -200,10 +200,23 @@ impl Omamusic {
                 .timer(Duration::from_millis(500))
                 .await;
             let alive = this
-                .update_in(cx, |this, window, cx| this.tick(window, cx))
+                .update_in(cx, |this, window, cx| this.tick(false, window, cx))
                 .is_ok();
             if !alive {
                 break;
+            }
+        })
+        .detach();
+
+        let changes = player.subscribe();
+        cx.spawn_in(window, async move |this, cx| {
+            while changes.recv().await.is_ok() {
+                let alive = this
+                    .update_in(cx, |this, window, cx| this.tick(true, window, cx))
+                    .is_ok();
+                if !alive {
+                    break;
+                }
             }
         })
         .detach();
@@ -243,10 +256,10 @@ impl Omamusic {
         }
     }
 
-    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn tick(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
         let version = self.library.version();
         let playing = self.player.state() == PlayerState::Playing;
-        if version == self.lib_version && !playing && !self.was_playing {
+        if !force && version == self.lib_version && !playing && !self.was_playing {
             return;
         }
         if version != self.lib_version {

@@ -51,8 +51,20 @@ impl AudioBuffer {
 struct Shared {
     playback: Mutex<Playback>,
     audio: Mutex<AudioBuffer>,
+    listeners: Mutex<Vec<async_channel::Sender<()>>>,
     channels: usize,
     sample_rate: u32,
+}
+
+impl Shared {
+    fn changed(&self) {
+        self.listeners.lock().retain(|listener| {
+            !matches!(
+                listener.try_send(()),
+                Err(async_channel::TrySendError::Closed(_))
+            )
+        });
+    }
 }
 
 enum Command {
@@ -226,6 +238,7 @@ fn apply_command(
         }
         Command::Shutdown => return false,
     }
+    shared.changed();
     true
 }
 
@@ -268,6 +281,7 @@ fn run_decoder(shared: Arc<Shared>, commands: Receiver<Command>) {
                 };
                 source = next.and_then(|track| load_source(&shared, track));
                 end_of_file = false;
+                shared.changed();
                 continue;
             }
         }
@@ -363,6 +377,7 @@ impl Player {
                 ..Default::default()
             }),
             audio: Mutex::new(AudioBuffer::default()),
+            listeners: Mutex::new(Vec::new()),
             channels: channels as usize,
             sample_rate,
         });
@@ -401,6 +416,13 @@ impl Player {
             select(&mut p, index)
         };
         self.load(track);
+        self.shared.changed();
+    }
+
+    pub fn subscribe(&self) -> async_channel::Receiver<()> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.shared.listeners.lock().push(sender);
+        receiver
     }
 
     pub fn play_next(&self, tracks: Vec<Track>) {
@@ -422,15 +444,19 @@ impl Player {
             return;
         }
         insert(&mut p, tracks, next);
+        drop(p);
+        self.shared.changed();
     }
 
     pub fn remove(&self, indices: &[usize]) {
         remove(&mut self.shared.playback.lock(), indices);
+        self.shared.changed();
     }
 
     pub fn jump(&self, index: usize) {
         let track = select(&mut self.shared.playback.lock(), index);
         self.load(track);
+        self.shared.changed();
     }
 
     pub fn queue(&self) -> (Vec<Track>, Option<usize>) {
@@ -459,6 +485,8 @@ impl Player {
         if p.current.is_some() {
             p.state = PlayerState::Playing;
         }
+        drop(p);
+        self.shared.changed();
     }
 
     pub fn pause(&self) {
@@ -466,6 +494,8 @@ impl Player {
         if p.current.is_some() {
             p.state = PlayerState::Paused;
         }
+        drop(p);
+        self.shared.changed();
     }
 
     pub fn stop(&self) {
@@ -474,6 +504,8 @@ impl Player {
         p.queue.clear();
         p.order.clear();
         let _ = self.commands.send(Command::Clear);
+        drop(p);
+        self.shared.changed();
     }
 
     pub fn next(&self) {
@@ -485,6 +517,7 @@ impl Player {
         if !self.load(track) {
             self.stop();
         }
+        self.shared.changed();
     }
 
     pub fn previous(&self) {
@@ -501,6 +534,7 @@ impl Player {
         if !self.load(track) {
             self.seek(0.0);
         }
+        self.shared.changed();
     }
 
     pub fn seek(&self, secs: f64) {
@@ -535,12 +569,15 @@ impl Player {
                     .unwrap_or(0);
             }
         }
+        drop(p);
+        self.shared.changed();
     }
     pub fn shuffle(&self) -> bool {
         self.shared.playback.lock().shuffle
     }
     pub fn set_repeat(&self, mode: RepeatMode) {
         self.shared.playback.lock().repeat = mode;
+        self.shared.changed();
     }
     pub fn repeat(&self) -> RepeatMode {
         self.shared.playback.lock().repeat
