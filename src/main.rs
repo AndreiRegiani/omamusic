@@ -11,68 +11,25 @@ use app::Omamusic;
 use gpui_kit::{actions, px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
 use std::sync::Arc;
 
+use crate::config::AppConfig;
 use crate::library::Library;
 use crate::player::Player;
 
-actions!(omamusic, [TogglePlay, NextTrack, PrevTrack, Rescan]);
+actions!(
+    omamusic,
+    [
+        TogglePlay,
+        NextTrack,
+        PrevTrack,
+        Rescan,
+        FocusSearch,
+        GoBack
+    ]
+);
 
 fn main() {
     if std::env::args().any(|a| a == "--dump-library") {
-        let lib = Library::new().expect("library");
-        for _ in 0..150 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let s = lib.snapshot();
-            if !s.folders.is_empty() && !s.scanning && s.version > 0 {
-                break;
-            }
-        }
-        let s = lib.snapshot();
-        println!("albums={} tracks={}", s.albums.len(), s.all_tracks.len());
-        for a in &s.albums {
-            println!(
-                "ALBUM {:?} artist={:?} year={} n={}",
-                a.title,
-                a.artist,
-                a.year,
-                a.tracks.len()
-            );
-            for t in &a.tracks {
-                println!(
-                    "  TRK {:?} artist={:?} album={:?} no={} dur={:.1} file={}",
-                    t.title,
-                    t.artist,
-                    t.album,
-                    t.track_number,
-                    t.duration,
-                    t.path.display()
-                );
-            }
-        }
-        // Exercise fuzzy search paths.
-        for q in [
-            "neon",
-            "test artist",
-            "song",
-            "midnight drive",
-            "zzz-no-match",
-        ] {
-            lib.set_query(q.to_string());
-            // set_query is async (background thread); poll briefly.
-            for _ in 0..25 {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                if lib.snapshot().query == q {
-                    break;
-                }
-            }
-            let s = lib.snapshot();
-            println!(
-                "query={q:?} albums={} tracks={} artists={}",
-                s.filtered_albums.len(),
-                s.filtered_tracks.len(),
-                s.artists.len()
-            );
-        }
-        lib.set_query(String::new());
+        dump_library();
         return;
     }
     gpui_kit::application()
@@ -85,10 +42,12 @@ fn main() {
                 gpui_kit::KeyBinding::new("right", NextTrack, None),
                 gpui_kit::KeyBinding::new("left", PrevTrack, None),
                 gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
+                gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
+                gpui_kit::KeyBinding::new("alt-left", GoBack, None),
             ]);
 
             let library = Arc::new(Library::new().expect("library"));
-            let player = Arc::new(Player::new().expect("player"));
+            let player = Arc::new(Player::new(AppConfig::load().volume).expect("player"));
 
             cx.on_action({
                 let player = player.clone();
@@ -137,4 +96,53 @@ fn main() {
             .expect("open omamusic");
             cx.activate(true);
         });
+}
+
+fn dump_library() {
+    let lib = Library::new().expect("library");
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let s = lib.snapshot();
+        if !s.folders.is_empty() && !s.scanning && s.version > 0 {
+            break;
+        }
+    }
+    let s = lib.snapshot();
+    println!("albums={} tracks={}", s.albums.len(), s.all_tracks.len());
+    for a in &s.albums {
+        println!(
+            "ALBUM {:?} artist={:?} year={} n={}",
+            a.title,
+            a.artist,
+            a.year,
+            a.tracks.len()
+        );
+        for t in a.tracks.iter() {
+            println!(
+                "  TRK {:?} artist={:?} album={:?} no={} dur={:.1} file={}",
+                t.title,
+                t.artist,
+                t.album,
+                t.track_number,
+                t.duration,
+                t.path.display()
+            );
+        }
+    }
+    for q in [
+        "neon",
+        "test artist",
+        "song",
+        "midnight drive",
+        "zzz-no-match",
+    ] {
+        lib.set_query(q.to_string());
+        let s = lib.snapshot();
+        println!(
+            "query={q:?} albums={} tracks={} artists={}",
+            s.filtered_albums.len(),
+            s.filtered_tracks.len(),
+            s.artists.len()
+        );
+    }
 }

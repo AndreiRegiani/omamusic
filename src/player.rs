@@ -1,4 +1,3 @@
-use crate::config::AppConfig;
 use crate::models::{PlayerState, RepeatMode, Track};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -37,6 +36,14 @@ struct AudioBuffer {
     samples: VecDeque<f32>,
     played_samples: u64,
     base_position: f64,
+}
+
+impl AudioBuffer {
+    fn reset(&mut self, base_position: f64) {
+        self.samples.clear();
+        self.played_samples = 0;
+        self.base_position = base_position;
+    }
 }
 
 struct Shared {
@@ -87,6 +94,41 @@ fn select(playback: &mut Playback, index: usize) -> Option<Track> {
     Some(track)
 }
 
+fn insert(playback: &mut Playback, tracks: Vec<Track>, next: bool) {
+    let (at, order_at) = if next {
+        let current = playback.current.as_ref().map(|c| c.path.clone());
+        let order_at = playback
+            .order
+            .iter()
+            .position(|t| Some(&t.path) == current.as_ref())
+            .map_or(playback.order.len(), |i| i + 1);
+        (playback.index + 1, order_at)
+    } else {
+        (playback.queue.len(), playback.order.len())
+    };
+    let at = at.min(playback.queue.len());
+    playback.queue.splice(at..at, tracks.iter().cloned());
+    playback.order.splice(order_at..order_at, tracks);
+}
+
+fn remove(playback: &mut Playback, indices: &[usize]) {
+    let mut indices = indices.to_vec();
+    indices.sort_unstable_by(|a, b| b.cmp(a));
+    indices.dedup();
+    for i in indices {
+        if i == playback.index || i >= playback.queue.len() {
+            continue;
+        }
+        let track = playback.queue.remove(i);
+        if i < playback.index {
+            playback.index -= 1;
+        }
+        if let Some(pos) = playback.order.iter().position(|t| t.path == track.path) {
+            playback.order.remove(pos);
+        }
+    }
+}
+
 fn stop(playback: &mut Playback) {
     playback.state = PlayerState::Stopped;
     playback.current = None;
@@ -100,15 +142,12 @@ fn fill_output<T: cpal::SizedSample + cpal::FromSample<f32>>(data: &mut [T], sha
     };
     let mut audio = shared.audio.lock();
     for sample in data {
-        let value = if playing {
-            if let Some(value) = audio.samples.pop_front() {
+        let value = match playing.then(|| audio.samples.pop_front()).flatten() {
+            Some(value) => {
                 audio.played_samples += 1;
                 value * volume
-            } else {
-                0.0
             }
-        } else {
-            0.0
+            None => 0.0,
         };
         *sample = T::from_sample(value.clamp(-1.0, 1.0));
     }
@@ -143,12 +182,7 @@ fn open_source(track: &Track, channels: usize, rate: u32) -> Result<(AudioSource
 }
 
 fn load_source(shared: &Shared, track: Track) -> Option<AudioSource> {
-    {
-        let mut audio = shared.audio.lock();
-        audio.samples.clear();
-        audio.played_samples = 0;
-        audio.base_position = 0.0;
-    }
+    shared.audio.lock().reset(0.0);
     match open_source(&track, shared.channels, shared.sample_rate) {
         Ok((source, duration)) => {
             shared.playback.lock().duration = duration;
@@ -178,10 +212,7 @@ fn apply_command(
                 if let Err(err) = source.try_seek(Duration::from_secs_f64(secs)) {
                     eprintln!("seek: {err}");
                 } else {
-                    let mut audio = shared.audio.lock();
-                    audio.samples.clear();
-                    audio.played_samples = 0;
-                    audio.base_position = secs;
+                    shared.audio.lock().reset(secs);
                     *end_of_file = false;
                 }
             }
@@ -189,10 +220,7 @@ fn apply_command(
         Command::Clear => {
             *source = None;
             *end_of_file = false;
-            let mut audio = shared.audio.lock();
-            audio.samples.clear();
-            audio.played_samples = 0;
-            audio.base_position = 0.0;
+            shared.audio.lock().reset(0.0);
         }
         Command::Shutdown => return false,
     }
@@ -241,18 +269,14 @@ fn run_decoder(shared: Arc<Shared>, commands: Receiver<Command>) {
                 continue;
             }
         }
-        if source.is_none() {
-            match commands.recv() {
-                Ok(command) => {
-                    if !apply_command(command, &shared, &mut source, &mut end_of_file) {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-            continue;
-        }
-        match commands.recv_timeout(Duration::from_millis(10)) {
+        let command = if source.is_none() {
+            commands
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            commands.recv_timeout(Duration::from_millis(10))
+        };
+        match command {
             Ok(command) => {
                 if !apply_command(command, &shared, &mut source, &mut end_of_file) {
                     return;
@@ -265,7 +289,7 @@ fn run_decoder(shared: Arc<Shared>, commands: Receiver<Command>) {
 }
 
 impl Player {
-    pub fn new() -> Result<Self> {
+    pub fn new(volume: f64) -> Result<Self> {
         let preferred = cpal::default_host().id();
         let mut hosts = vec![preferred];
         hosts.extend(
@@ -282,7 +306,7 @@ impl Player {
                 failures.push(format!("{id}: no default output device"));
                 continue;
             };
-            match Self::from_device(&device) {
+            match Self::from_device(&device, volume) {
                 Ok(player) => return Ok(player),
                 Err(err) => failures.push(format!("{id}: {err:#}")),
             }
@@ -290,7 +314,7 @@ impl Player {
         anyhow::bail!("no usable audio output: {}", failures.join("; "))
     }
 
-    fn from_device(device: &cpal::Device) -> Result<Self> {
+    fn from_device(device: &cpal::Device, volume: f64) -> Result<Self> {
         let mut supported = device
             .default_output_config()
             .context("query audio output")?;
@@ -311,7 +335,7 @@ impl Player {
         if config.channels == 0 || config.sample_rate == 0 {
             anyhow::bail!("audio device reported an invalid stream configuration");
         }
-        let mut player = Self::create(config.channels, config.sample_rate);
+        let mut player = Self::create(config.channels, config.sample_rate, volume);
         let shared = player.shared.clone();
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => build_output::<f32>(device, config, shared)?,
@@ -327,11 +351,10 @@ impl Player {
         Ok(player)
     }
 
-    fn create(channels: u16, sample_rate: u32) -> Self {
-        let config = AppConfig::load();
+    fn create(channels: u16, sample_rate: u32, volume: f64) -> Self {
         let shared = Arc::new(Shared {
             playback: Mutex::new(Playback {
-                volume: config.volume.clamp(0.0, 1.0),
+                volume: volume.clamp(0.0, 1.0),
                 ..Default::default()
             }),
             audio: Mutex::new(AudioBuffer::default()),
@@ -372,9 +395,50 @@ impl Player {
             };
             select(&mut p, index)
         };
-        if let Some(track) = track {
-            let _ = self.commands.send(Command::Load(track));
+        self.load(track);
+    }
+
+    pub fn play_next(&self, tracks: Vec<Track>) {
+        self.insert(tracks, true);
+    }
+
+    pub fn enqueue(&self, tracks: Vec<Track>) {
+        self.insert(tracks, false);
+    }
+
+    fn insert(&self, tracks: Vec<Track>, next: bool) {
+        if tracks.is_empty() {
+            return;
         }
+        let mut p = self.shared.playback.lock();
+        if p.current.is_none() {
+            drop(p);
+            self.play(tracks, 0);
+            return;
+        }
+        insert(&mut p, tracks, next);
+    }
+
+    pub fn remove(&self, indices: &[usize]) {
+        remove(&mut self.shared.playback.lock(), indices);
+    }
+
+    pub fn jump(&self, index: usize) {
+        let track = select(&mut self.shared.playback.lock(), index);
+        self.load(track);
+    }
+
+    pub fn queue(&self) -> (Vec<Track>, Option<usize>) {
+        let p = self.shared.playback.lock();
+        (p.queue.clone(), p.current.is_some().then_some(p.index))
+    }
+
+    fn load(&self, track: Option<Track>) -> bool {
+        let Some(track) = track else {
+            return false;
+        };
+        let _ = self.commands.send(Command::Load(track));
+        true
     }
 
     pub fn toggle(&self) {
@@ -413,9 +477,7 @@ impl Player {
             let next = following(p.index, p.queue.len(), p.repeat, true);
             next.and_then(|index| select(&mut p, index))
         };
-        if let Some(track) = track {
-            let _ = self.commands.send(Command::Load(track));
-        } else {
+        if !self.load(track) {
             self.stop();
         }
     }
@@ -431,9 +493,7 @@ impl Player {
                 None
             }
         };
-        if let Some(track) = track {
-            let _ = self.commands.send(Command::Load(track));
-        } else {
+        if !self.load(track) {
             self.seek(0.0);
         }
     }
@@ -446,13 +506,7 @@ impl Player {
     }
 
     pub fn set_volume(&self, volume: f64) {
-        let volume = volume.clamp(0.0, 1.0);
-        self.shared.playback.lock().volume = volume;
-        let mut config = AppConfig::load();
-        config.volume = volume;
-        if let Err(err) = config.save() {
-            eprintln!("save volume: {err:#}");
-        }
+        self.shared.playback.lock().volume = volume.clamp(0.0, 1.0);
     }
 
     pub fn volume(&self) -> f64 {
@@ -522,7 +576,7 @@ impl Drop for Player {
 #[cfg(test)]
 impl Player {
     fn new_test() -> Self {
-        let mut player = Self::create(2, 48_000);
+        let mut player = Self::create(2, 48_000, 1.0);
         player.test_running.store(true, Ordering::Relaxed);
         let shared = player.shared.clone();
         let running = player.test_running.clone();
@@ -540,7 +594,6 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::MetadataReader;
     use std::time::Instant;
 
     fn track(path: std::path::PathBuf) -> Track {
@@ -554,6 +607,48 @@ mod tests {
             duration: 0.0,
             album_id: String::new(),
         }
+    }
+
+    fn named(name: &str) -> Track {
+        track(std::path::PathBuf::from(name))
+    }
+
+    fn names(tracks: &[Track]) -> Vec<String> {
+        tracks
+            .iter()
+            .map(|t| t.path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn playing(queue: &[&str], order: &[&str], index: usize) -> Playback {
+        let queue: Vec<Track> = queue.iter().map(|n| named(n)).collect();
+        Playback {
+            current: queue.get(index).cloned(),
+            order: order.iter().map(|n| named(n)).collect(),
+            queue,
+            index,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn play_next_inserts_after_current_in_queue_and_order() {
+        let mut p = playing(&["c", "a", "b"], &["a", "b", "c"], 0);
+        insert(&mut p, vec![named("x"), named("y")], true);
+        assert_eq!(names(&p.queue), ["c", "x", "y", "a", "b"]);
+        assert_eq!(names(&p.order), ["a", "b", "c", "x", "y"]);
+        insert(&mut p, vec![named("z")], false);
+        assert_eq!(names(&p.queue), ["c", "x", "y", "a", "b", "z"]);
+        assert_eq!(names(&p.order), ["a", "b", "c", "x", "y", "z"]);
+    }
+
+    #[test]
+    fn remove_keeps_current_and_shifts_index() {
+        let mut p = playing(&["a", "b", "c", "d"], &["a", "b", "c", "d"], 2);
+        remove(&mut p, &[0, 2, 3]);
+        assert_eq!(names(&p.queue), ["b", "c"]);
+        assert_eq!(names(&p.order), ["b", "c"]);
+        assert_eq!(p.index, 1);
     }
 
     fn wait_for(mut condition: impl FnMut() -> bool) -> bool {
@@ -635,7 +730,7 @@ mod tests {
             .status()
             .expect("ffmpeg is required only to create the test fixture");
         assert!(status.success());
-        let metadata = MetadataReader::new().read(&path).unwrap();
+        let metadata = crate::metadata::read(&path);
         assert_eq!(metadata.title, "ID3 test");
         let player = Player::new_test();
         player.play(vec![track(path.clone())], 0);
@@ -653,7 +748,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("omamusic-device-test-{}.wav", std::process::id()));
         write_silent_wav(&path);
-        let player = Player::new().unwrap();
+        let player = Player::new(1.0).unwrap();
         player.play(vec![track(path.clone())], 0);
         assert!(
             wait_for(|| player.position() > 0.05),

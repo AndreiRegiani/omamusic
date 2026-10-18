@@ -27,7 +27,15 @@ impl AppConfig {
         }
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub fn update(change: impl FnOnce(&mut Self)) {
+        let mut config = Self::load();
+        change(&mut config);
+        if let Err(err) = config.save() {
+            eprintln!("save config: {err:#}");
+        }
+    }
+
+    fn save(&self) -> Result<()> {
         let p = Self::path();
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;

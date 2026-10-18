@@ -17,7 +17,6 @@ parking_lot = "0.12"
 walkdir = "2.5"
 rand = "0.8"
 image = { version = "0.25", features = ["jpeg", "png", "bmp", "gif", "tiff", "webp"] }
-base64 = "0.22"
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 rodio = { version = "0.22.2", default-features = false, features = ["symphonia-all"] }
 

@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Track {
     pub path: PathBuf,
     pub title: String,
@@ -13,52 +13,25 @@ pub struct Track {
     pub album_id: String,
 }
 
-impl Track {
-    pub fn display_title(&self) -> &str {
-        if self.title.is_empty() {
-            self.path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unknown")
-        } else {
-            &self.title
-        }
-    }
-
-    pub fn display_artist(&self) -> &str {
-        if self.artist.is_empty() {
-            "Unknown Artist"
-        } else {
-            &self.artist
-        }
-    }
-
-    pub fn display_album(&self) -> &str {
-        if self.album.is_empty() {
-            "Unknown Album"
-        } else {
-            &self.album
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Album {
     pub id: String,
     pub title: String,
     pub artist: String,
     pub year: u32,
-    pub tracks: Vec<Track>,
+    pub tracks: Arc<[Track]>,
+    pub track_titles: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Albums,
     Artists,
     Songs,
+    Queue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RepeatMode {
     #[default]
     Off,
@@ -76,7 +49,7 @@ impl RepeatMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayerState {
     #[default]
     Stopped,
