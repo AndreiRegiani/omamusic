@@ -2,10 +2,28 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub folders: Vec<PathBuf>,
     pub volume: f64,
+    pub quit_on_close: bool,
+    pub plain_tray_icon: bool,
+    pub start_hidden: bool,
+    pub tray_hint_shown: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            folders: Vec::new(),
+            volume: 1.0,
+            quit_on_close: false,
+            plain_tray_icon: false,
+            start_hidden: false,
+            tray_hint_shown: false,
+        }
+    }
 }
 
 impl AppConfig {
@@ -21,10 +39,7 @@ impl AppConfig {
                 return cfg;
             }
         }
-        Self {
-            volume: 1.0,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     pub fn update(change: impl FnOnce(&mut Self)) {

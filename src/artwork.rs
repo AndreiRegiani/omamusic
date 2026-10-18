@@ -95,6 +95,24 @@ impl ArtworkCache {
         None
     }
 
+    pub fn thumbnail(&self, album_id: &str, size: u32) -> Option<Arc<Image>> {
+        let key = (album_id.to_string(), size);
+        let (raw, generation) = {
+            let covers = self.inner.lock();
+            if let Some(image) = covers.rendered.get(&key) {
+                return Some(image.clone());
+            }
+            (covers.raw.get(album_id)?.clone(), covers.generation)
+        };
+        let image = render(&raw, size)?;
+        let mut covers = self.inner.lock();
+        if covers.generation == generation {
+            covers.pending.remove(&key);
+            covers.rendered.insert(key, image.clone());
+        }
+        Some(image)
+    }
+
     pub fn subscribe(&self) -> Receiver<()> {
         let (sender, receiver) = async_channel::bounded(1);
         self.listeners.lock().push(sender);
