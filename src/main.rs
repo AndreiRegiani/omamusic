@@ -8,11 +8,17 @@ mod metadata;
 mod models;
 mod mpris;
 mod player;
+mod player_bar;
 mod tray;
 
 use app::Omamusic;
 use desktop::Command;
-use gpui_kit::{actions, px, size, App, AppContext, Bounds, QuitMode, WindowBounds, WindowOptions};
+use gpui_kit::{
+    actions, div, px, size, App, AppContext, Bounds, Context, Entity, IntoElement, ParentElement,
+    QuitMode, Render, StyleRefinement, Styled, Window, WindowBounds, WindowOptions,
+};
+use gpui_omarchy::{separator, ActiveTheme};
+use player_bar::PlayerBar;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
@@ -155,10 +161,39 @@ fn show_window(library: &Arc<Library>, player: &Arc<Player>, cx: &mut App) {
             ))),
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| Omamusic::new(library, player, window, cx)),
+        |window, cx| {
+            cx.new(|cx| {
+                let main = cx.new(|cx| Omamusic::new(library.clone(), player.clone(), window, cx));
+                let bar =
+                    cx.new(|cx| PlayerBar::new(library, player, main.downgrade(), window, cx));
+                Root { main, bar }
+            })
+        },
     );
     if let Err(err) = opened {
         eprintln!("open window: {err:#}");
+    }
+}
+
+struct Root {
+    main: Entity<Omamusic>,
+    bar: Entity<PlayerBar>,
+}
+
+impl Render for Root {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(cx.omarchy().background)
+            .child(
+                self.main
+                    .clone()
+                    .cached(StyleRefinement::default().flex_1().min_h_0().w_full()),
+            )
+            .child(separator(cx))
+            .child(self.bar.clone())
     }
 }
 
