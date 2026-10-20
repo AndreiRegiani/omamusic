@@ -634,9 +634,18 @@ impl Player {
         let shared = player.shared.clone();
         let running = player.test_running.clone();
         player.test_driver = Some(std::thread::spawn(move || {
+            // Pace by elapsed time so that a slow sleep on a busy CI runner does not slow playback.
+            let samples_per_second = (shared.sample_rate as usize * shared.channels) as f64;
+            let start = std::time::Instant::now();
             let mut block = vec![0.0f32; 960];
+            let mut consumed = 0usize;
             while running.load(Ordering::Relaxed) {
-                fill_output(&mut block, &shared);
+                let due = (start.elapsed().as_secs_f64() * samples_per_second) as usize;
+                while consumed < due {
+                    let len = block.len().min(due - consumed);
+                    fill_output(&mut block[..len], &shared);
+                    consumed += len;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }));
