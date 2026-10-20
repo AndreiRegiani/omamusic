@@ -18,7 +18,7 @@ use std::time::Duration;
 
 type AudioSource = UniformSourceIterator<Decoder<BufReader<File>>>;
 
-const PULSE_FRAMES: u32 = 1024;
+
 
 #[derive(Default)]
 struct Playback {
@@ -317,7 +317,7 @@ fn run_decoder(shared: Arc<Shared>, commands: Receiver<Command>) {
 impl Player {
     pub fn new(volume: f64) -> Result<Self> {
         let mut hosts = Vec::new();
-        for id in [cpal::HostId::Alsa, cpal::default_host().id()]
+        for id in [cpal::default_host().id()]
             .into_iter()
             .chain(cpal::available_hosts())
         {
@@ -342,7 +342,7 @@ impl Player {
         anyhow::bail!("no usable audio output: {}", failures.join("; "))
     }
 
-    fn from_device(device: &cpal::Device, host: cpal::HostId, volume: f64) -> Result<Self> {
+    fn from_device(device: &cpal::Device, _host: cpal::HostId, volume: f64) -> Result<Self> {
         let mut supported = device
             .default_output_config()
             .context("query audio output")?;
@@ -359,12 +359,8 @@ impl Player {
                 .context("no supported PCM audio format")?
                 .with_sample_rate(48_000);
         }
-        let mut config = supported.config();
-        if let cpal::SupportedBufferSize::Range { min, max } = supported.buffer_size() {
-            if host == cpal::HostId::PulseAudio {
-                config.buffer_size = cpal::BufferSize::Fixed(PULSE_FRAMES.clamp(*min, *max));
-            }
-        }
+        let config = supported.config();
+        // PulseAudio-specific buffer size handling is not applicable on macOS (CoreAudio).
         if config.channels == 0 || config.sample_rate == 0 {
             anyhow::bail!("audio device reported an invalid stream configuration");
         }
