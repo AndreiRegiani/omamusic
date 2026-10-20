@@ -18,8 +18,6 @@ use std::time::Duration;
 
 type AudioSource = UniformSourceIterator<Decoder<BufReader<File>>>;
 
-
-
 #[derive(Default)]
 struct Playback {
     queue: Arc<[Track]>,

@@ -56,3 +56,15 @@ pub enum PlayerState {
     Playing,
     Paused,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeat_mode_cycles_off_all_one() {
+        assert_eq!(RepeatMode::Off.next(), RepeatMode::All);
+        assert_eq!(RepeatMode::All.next(), RepeatMode::One);
+        assert_eq!(RepeatMode::One.next(), RepeatMode::Off);
+    }
+}
