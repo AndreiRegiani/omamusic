@@ -95,3 +95,38 @@ impl FuzzySearch {
         best
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_query_matches_everything() {
+        assert_eq!(FuzzySearch::new("").score("anything"), 100);
+        assert_eq!(FuzzySearch::new("   ").score(""), 100);
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        let search = FuzzySearch::new("BEATLES");
+        assert!(search.score("The Beatles") > 0);
+    }
+
+    #[test]
+    fn unrelated_text_does_not_match() {
+        assert_eq!(FuzzySearch::new("zeppelin").score("The Beatles"), 0);
+    }
+
+    #[test]
+    fn contiguous_word_start_scores_higher_than_scattered() {
+        let search = FuzzySearch::new("abba");
+        assert!(search.score("ABBA Gold") > search.score("xaxbxbxa"));
+    }
+
+    #[test]
+    fn every_token_must_match() {
+        let search = FuzzySearch::new("dark moon");
+        assert!(search.score("Dark Side of the Moon") > 0);
+        assert_eq!(search.score("Dark Side of the Sun"), 0);
+    }
+}
