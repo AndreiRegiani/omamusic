@@ -1,10 +1,8 @@
 # Omamusic
 
-A local music player for Omarchy Linux, inspired by the native macOS [Overdrive](https://github.com/skhaz/overdrive) interface. The application is written in Rust with GPUI and uses the active Omarchy theme.
+Minimalist local music player optimized for Omarchy Linux written in Rust & GPUI.
 
 ## Install
-
-On Omarchy / Arch Linux:
 
 ```sh
 cargo install --path .
