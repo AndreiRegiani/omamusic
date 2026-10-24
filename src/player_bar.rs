@@ -268,17 +268,19 @@ impl Render for PlayerBar {
                             .flex()
                             .flex_col()
                             .w(rems(10.))
-                            .min_w(rems(6.))
+                            .min_w(rems(4.))
                             .child(
                                 div()
                                     .text_size(rems(0.75))
                                     .text_color(theme.foreground)
+                                    .truncate()
                                     .child(title),
                             )
                             .child(
                                 div()
                                     .text_size(rems(0.6875))
                                     .text_color(theme.secondary)
+                                    .truncate()
                                     .child(sub),
                             ),
                     ),
@@ -361,13 +363,14 @@ impl Render for PlayerBar {
                 div()
                     .flex()
                     .flex_1()
-                    .min_w(rems(6.))
+                    .min_w(rems(14.))
                     .items_center()
-                    .gap(rems(0.5))
+                    .gap(rems(0.375))
                     .child(
                         div()
-                            .w(rems(3.))
-                            .text_size(rems(0.6875))
+                            .min_w(rems(3.5))
+                            .max_w(rems(7.))
+                            .text_size(rems(0.625))
                             .text_color(theme.secondary)
                             .child(format_time(pos)),
                     )
@@ -378,8 +381,9 @@ impl Render for PlayerBar {
                     )))
                     .child(
                         div()
-                            .w(rems(3.))
-                            .text_size(rems(0.6875))
+                            .min_w(rems(3.5))
+                            .max_w(rems(7.))
+                            .text_size(rems(0.625))
                             .text_color(theme.secondary)
                             .child(format_time(dur)),
                     ),
@@ -391,8 +395,8 @@ impl Render for PlayerBar {
             )
             .child(
                 div()
-                    .w(rems(6.))
-                    .min_w(rems(4.))
+                    .w(rems(5.))
+                    .min_w(rems(3.))
                     .child(slider(&self.volume, false, window, cx)),
             )
     }

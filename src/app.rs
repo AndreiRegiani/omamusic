@@ -34,6 +34,8 @@ pub struct Omamusic {
     lib_version: u64,
     prefs: AppConfig,
     new_folder: Entity<InputState>,
+    rescan_notify: Option<(String, f32)>,
+    prev_scanning: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -50,6 +52,7 @@ enum RowAction {
     GoToAlbum,
     GoToArtist,
     Remove,
+    ExportFile,
 }
 
 const TRACK_ACTIONS: &[RowAction] = &[
@@ -58,6 +61,7 @@ const TRACK_ACTIONS: &[RowAction] = &[
     RowAction::AddToQueue,
     RowAction::GoToAlbum,
     RowAction::GoToArtist,
+    RowAction::ExportFile,
 ];
 const QUEUE_ACTIONS: &[RowAction] = &[
     RowAction::Play,
@@ -79,6 +83,7 @@ impl RowAction {
             RowAction::Play | RowAction::PlayNext | RowAction::AddToQueue => 0,
             RowAction::GoToAlbum | RowAction::GoToArtist => 1,
             RowAction::Remove => 2,
+            RowAction::ExportFile => 3,
         }
     }
 
@@ -90,6 +95,7 @@ impl RowAction {
             RowAction::GoToAlbum => ("Go to Album", IconName::Disc3),
             RowAction::GoToArtist => ("Go to Artist", IconName::Mic),
             RowAction::Remove => ("Remove from Queue", IconName::ListX),
+            RowAction::ExportFile => ("Export File…", IconName::Download),
         };
         MenuItem::new(label).icon(icon_name)
     }
@@ -158,7 +164,11 @@ impl Omamusic {
         let new_folder = cx.new(|cx| InputState::new(window, cx).placeholder("Enter folder path"));
         cx.observe(&query, |this, state, cx| {
             let text = state.read(cx).text().to_string();
-            this.library.set_query(text);
+            this.library.set_query(text.clone());
+            // Search always filters all songs, switch to Songs section
+            if !text.trim().is_empty() {
+                this.set_section(Section::Songs, cx);
+            }
             this.pages.clear();
             this.clear_selection();
             cx.notify();
@@ -211,7 +221,7 @@ impl Omamusic {
                     false,
                 )
             }
-            _ => (Section::Albums, Vec::new(), false),
+            _ => (Section::Songs, Vec::new(), false),
         };
 
         Self {
@@ -226,6 +236,8 @@ impl Omamusic {
             lib_version: 0,
             prefs: AppConfig::load(),
             new_folder,
+            rescan_notify: None,
+            prev_scanning: false,
         }
     }
 
@@ -237,8 +249,52 @@ impl Omamusic {
         if version != self.lib_version {
             self.clear_selection();
         }
+
+        // Detect scan completion: scanning went from true to false
+        let snap = self.library.snapshot();
+        let scanning_now = snap.scanning;
+        let notify_msg = if self.prev_scanning && !scanning_now {
+            Some(format!(
+                "{} albums · {} songs",
+                snap.albums.len(),
+                snap.all_tracks.len()
+            ))
+        } else {
+            None
+        };
+        drop(snap);
+        self.prev_scanning = scanning_now;
+        if let Some(msg) = notify_msg {
+            self.show_notify(msg, cx);
+        }
+
         self.lib_version = version;
         cx.notify();
+    }
+
+    fn show_notify(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.rescan_notify = Some((msg, 1.0));
+        cx.notify();
+        // Schedule fade-out after 2s (over 300ms) and then remove
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(2000))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(entry) = this.rescan_notify.as_mut() {
+                    entry.1 = 0.0;
+                }
+                cx.notify();
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.rescan_notify = None;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn show_album(&mut self, album_id: String, cx: &mut Context<Self>) {
@@ -328,8 +384,42 @@ impl Omamusic {
                 self.player.remove(&rows);
                 self.clear_selection();
             }
+            RowAction::ExportFile => {
+                if tracks.len() == 1 {
+                    let track = tracks[0].clone();
+                    let this = cx.entity().downgrade();
+                    cx.spawn(async move |_, cx| {
+                        let _ = this.update(cx, |this, cx| this.export_track(track, cx));
+                    })
+                    .detach();
+                }
+            }
         }
         cx.notify();
+    }
+
+    fn export_track(&mut self, track: Track, cx: &mut Context<Self>) {
+        let path = track.path.clone();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("track");
+        let download_dir =
+            dirs::download_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+        let _default_path = download_dir.join(file_name);
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Export File".into()),
+        });
+        cx.spawn(async move |_, _cx| {
+            if let Ok(Ok(Some(mut paths))) = picked.await {
+                if let Some(dest) = paths.pop() {
+                    if let Err(e) = std::fs::copy(&path, &dest) {
+                        eprintln!("export file: {e}");
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     fn tracks_action(&mut self, action: RowAction, tracks: &[Track], cx: &mut Context<Self>) {
@@ -338,6 +428,16 @@ impl Omamusic {
             RowAction::PlayNext => self.player.play_next(tracks.to_vec()),
             RowAction::AddToQueue => self.player.enqueue(tracks.to_vec()),
             RowAction::GoToAlbum | RowAction::GoToArtist | RowAction::Remove => {}
+            RowAction::ExportFile => {
+                if tracks.len() == 1 {
+                    let track = tracks[0].clone();
+                    let this = cx.entity().downgrade();
+                    cx.spawn(async move |_, cx| {
+                        let _ = this.update(cx, |this, cx| this.export_track(track, cx));
+                    })
+                    .detach();
+                }
+            }
         }
         cx.notify();
     }
@@ -505,9 +605,9 @@ impl Render for Omamusic {
         let snap = self.library.snapshot();
         let theme = cx.omarchy().clone();
         let nav = [
+            ("nav-songs", "Songs", IconName::Music, Section::Songs),
             ("nav-albums", "Albums", IconName::Disc3, Section::Albums),
             ("nav-artists", "Artists", IconName::Mic, Section::Artists),
-            ("nav-songs", "Songs", IconName::Music, Section::Songs),
             ("nav-queue", "Up Next", IconName::ListMusic, Section::Queue),
         ];
 
@@ -601,7 +701,10 @@ impl Render for Omamusic {
                                             icon_name,
                                             self.section == section,
                                             cx,
-                                            cx.listener(move |this, _, _, cx| {
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.query.update(cx, |q, cx| {
+                                                    q.set_value("", window, cx);
+                                                });
                                                 this.set_section(section, cx)
                                             }),
                                         )
@@ -611,6 +714,7 @@ impl Render for Omamusic {
                                         div()
                                             .text_size(rems(0.6875))
                                             .text_color(theme.secondary)
+                                            .text_center()
                                             .child(format!(
                                                 "{} albums · {} songs",
                                                 snap.albums.len(),
@@ -667,6 +771,45 @@ impl Render for Omamusic {
                     )
                     .when(self.show_settings, |d| {
                         d.child(self.render_settings(&snap, window, cx))
+                    })
+                    .when(self.rescan_notify.is_some(), |d| {
+                        let (msg, opacity) = self
+                            .rescan_notify
+                            .as_ref()
+                            .map(|(m, o)| (m.clone(), *o))
+                            .unwrap_or_default();
+                        d.child(
+                            div()
+                                .absolute()
+                                .top(rems(1.))
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .opacity(opacity)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(rems(0.5))
+                                        .px(rems(1.))
+                                        .py(rems(0.5))
+                                        .bg(theme.background)
+                                        .border_1()
+                                        .border_color(theme.success.opacity(0.5))
+                                        .child(
+                                            icon(IconName::Check)
+                                                .size(rems(0.75))
+                                                .text_color(theme.success),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(rems(0.75))
+                                                .text_color(theme.foreground)
+                                                .child(msg),
+                                        ),
+                                ),
+                        )
                     }),
             )
     }
@@ -1270,92 +1413,133 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        panel("Settings", cx)
+        let theme = cx.omarchy();
+        // Overlay backdrop
+        div()
+            .absolute()
+            .size_full()
+            .bg(theme.background.opacity(0.6))
+            .flex()
+            .items_center()
+            .justify_center()
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(rems(0.25))
-                    .child(self.pref_switch(
-                        "pref-close-to-tray",
-                        "Close window to tray",
-                        !self.prefs.quit_on_close,
-                        |c, on| c.quit_on_close = !on,
-                        cx,
-                    ))
-                    .child(self.pref_switch(
-                        "pref-tray-cover",
-                        "Use album cover as tray icon",
-                        !self.prefs.plain_tray_icon,
-                        |c, on| c.plain_tray_icon = !on,
-                        cx,
-                    ))
-                    .child(self.pref_switch(
-                        "pref-start-hidden",
-                        "Start hidden in tray",
-                        self.prefs.start_hidden,
-                        |c, on| c.start_hidden = on,
-                        cx,
-                    )),
-            )
-            .child(separator(cx))
-            .child(
-                div()
+                panel("Settings", cx)
+                    .w(rems(32.))
+                    .max_h(rems(40.))
                     .flex()
                     .flex_col()
                     .gap(rems(0.5))
-                    .children(snap.folders.iter().map(|f| {
-                        let p = f.clone();
+                    .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(rems(0.5))
+                            .justify_between()
                             .child(
                                 div()
-                                    .flex_1()
-                                    .text_size(rems(0.6875))
-                                    .child(f.to_string_lossy().to_string()),
+                                    .text_size(rems(0.875))
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .child("Settings"),
                             )
                             .child(
-                                button("rm-folder", "Remove", ButtonVariant::Secondary, cx)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.library.remove_folder(&p);
+                                icon_button(
+                                    "close-settings-x",
+                                    IconName::Close,
+                                    "Close settings",
+                                    ButtonVariant::Secondary,
+                                    cx,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.show_settings = false;
                                         cx.notify();
-                                    })),
-                            )
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(rems(0.5))
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(separator(cx))
                     .child(
                         div()
-                            .flex_1()
-                            .child(input("new-folder", &self.new_folder, window, cx)),
+                            .flex()
+                            .flex_col()
+                            .gap(rems(0.25))
+                            .child(self.pref_switch(
+                                "pref-close-to-tray",
+                                "Close window to tray",
+                                !self.prefs.quit_on_close,
+                                |c, on| c.quit_on_close = !on,
+                                cx,
+                            ))
+                            .child(self.pref_switch(
+                                "pref-tray-cover",
+                                "Use album cover as tray icon",
+                                !self.prefs.plain_tray_icon,
+                                |c, on| c.plain_tray_icon = !on,
+                                cx,
+                            ))
+                            .child(self.pref_switch(
+                                "pref-start-hidden",
+                                "Start hidden in tray",
+                                self.prefs.start_hidden,
+                                |c, on| c.start_hidden = on,
+                                cx,
+                            )),
+                    )
+                    .child(separator(cx))
+                    .child(div().flex().flex_col().gap(rems(0.5)).children(
+                        snap.folders.iter().map(|f| {
+                            let p = f.clone();
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(rems(0.5))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(rems(0.6875))
+                                        .child(f.to_string_lossy().to_string()),
+                                )
+                                .child(
+                                    button("rm-folder", "Remove", ButtonVariant::Secondary, cx)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.library.remove_folder(&p);
+                                            cx.notify();
+                                        })),
+                                )
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(rems(0.5))
+                            .child(div().flex_1().child(input(
+                                "new-folder",
+                                &self.new_folder,
+                                window,
+                                cx,
+                            )))
+                            .child(
+                                button("browse-folder", "Browse…", ButtonVariant::Secondary, cx)
+                                    .on_click(cx.listener(|this, _, _, cx| this.browse_folder(cx))),
+                            ),
                     )
                     .child(
-                        button("browse-folder", "Browse…", ButtonVariant::Secondary, cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.browse_folder(cx))),
+                        button("add-folder", "Add ~/Music", ButtonVariant::Primary, cx).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(music) = dirs::audio_dir() {
+                                    this.library.add_folder(music);
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        button("close-settings", "Close", ButtonVariant::Secondary, cx).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.show_settings = false;
+                                cx.notify();
+                            }),
+                        ),
                     ),
-            )
-            .child(
-                button("add-folder", "Add ~/Music", ButtonVariant::Primary, cx).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        if let Some(music) = dirs::audio_dir() {
-                            this.library.add_folder(music);
-                        }
-                        cx.notify();
-                    }),
-                ),
-            )
-            .child(
-                button("close-settings", "Close", ButtonVariant::Secondary, cx).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.show_settings = false;
-                        cx.notify();
-                    }),
-                ),
             )
     }
 }

@@ -6,6 +6,7 @@ use crate::models::{Album, Track};
 use anyhow::Result;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LibrarySnapshot {
     pub folders: Vec<PathBuf>,
     pub albums: Vec<Album>,
@@ -24,6 +25,16 @@ pub struct LibrarySnapshot {
     pub scanning: bool,
     pub query: String,
     pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LibraryCache {
+    folders: Vec<PathBuf>,
+    albums: Vec<Album>,
+    all_tracks: Vec<Track>,
+    artists: Vec<(String, Vec<Album>)>,
+    version: u64,
+    timestamp: u64,
 }
 
 type SharedSnapshot = Arc<RwLock<Arc<LibrarySnapshot>>>;
@@ -61,29 +72,92 @@ impl Library {
         let folders = AppConfig::load().folders;
         let (rescan_tx, rx) = mpsc::channel::<()>();
         let watcher = Self::make_watcher(&folders, &rescan_tx)?;
-        let state: SharedSnapshot = Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
-            folders,
+
+        // Try to load cache for instant startup
+        let temp_state = Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
+            folders: folders.clone(),
             ..Default::default()
         })));
         let covers = ArtworkCache::default();
+        let mut lib = Self {
+            state: temp_state,
+            covers: covers.clone(),
+            watcher: Mutex::new(None),
+            rescan_tx: rescan_tx.clone(),
+        };
 
-        let state_c = state.clone();
-        let covers_c = covers.clone();
+        if let Some(cache) = lib.load_cache() {
+            if cache.folders == folders {
+                // Cache is valid for current folders, load it
+                let mut snapshot = LibrarySnapshot {
+                    folders: cache.folders,
+                    albums: cache.albums,
+                    all_tracks: cache.all_tracks.into(),
+                    filtered_tracks: Arc::new([]),
+                    filtered_albums: Arc::new([]),
+                    artists: cache.artists,
+                    scanning: false,
+                    query: String::new(),
+                    version: cache.version,
+                };
+                Self::apply_search(&mut snapshot);
+                let state = Arc::new(RwLock::new(Arc::new(snapshot)));
+                lib.state = state;
+            }
+        }
+
+        let state = lib.state.clone();
+        let covers = lib.covers.clone();
+        let rescan_tx_clone = lib.rescan_tx.clone();
+
         std::thread::spawn(move || {
-            Self::do_scan(&state_c, &covers_c);
+            Self::do_scan(&state, &covers);
             while rx.recv().is_ok() {
                 std::thread::sleep(Duration::from_millis(800));
                 while rx.try_recv().is_ok() {}
-                Self::do_scan(&state_c, &covers_c);
+                Self::do_scan(&state, &covers);
             }
         });
 
         Ok(Self {
-            state,
-            covers,
+            state: lib.state,
+            covers: lib.covers,
             watcher: Mutex::new(watcher),
-            rescan_tx,
+            rescan_tx: rescan_tx_clone,
         })
+    }
+
+    fn cache_path() -> Option<PathBuf> {
+        dirs::cache_dir().map(|d| d.join("omamusic").join("library_cache.json"))
+    }
+
+    fn load_cache(&self) -> Option<LibraryCache> {
+        let path = Self::cache_path()?;
+        let data = std::fs::read(path).ok()?;
+        serde_json::from_slice(&data).ok()
+    }
+
+    fn save_cache(snapshot: &LibrarySnapshot) {
+        if let Some(path) = Library::cache_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let cache = LibraryCache {
+                folders: snapshot.folders.clone(),
+                albums: snapshot.albums.clone(),
+                all_tracks: snapshot.all_tracks.iter().cloned().collect(),
+                artists: snapshot.artists.clone(),
+                version: snapshot.version,
+                timestamp: match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                {
+                    Ok(d) => d.as_secs(),
+                    Err(_) => 0,
+                },
+            };
+            if let Ok(data) = serde_json::to_vec(&cache) {
+                let _ = std::fs::write(path, data);
+            }
+        }
     }
 
     pub fn snapshot(&self) -> Arc<LibrarySnapshot> {
@@ -307,15 +381,20 @@ impl Library {
         covers.replace_all(cover_map);
 
         // Song order follows album order, like the reference player.
-        let all_tracks = albums
+        let all_tracks: Vec<Track> = albums
             .iter()
             .flat_map(|a| a.tracks.iter().cloned())
             .collect();
         update(state, |s| {
             s.albums = albums;
-            s.all_tracks = all_tracks;
+            s.all_tracks = all_tracks.into();
             s.scanning = false;
             Self::apply_search(s);
         });
+
+        // Save cache for fast startup next time
+        let snapshot = state.read().clone();
+        Self::save_cache(&snapshot);
+        drop(snapshot);
     }
 }
