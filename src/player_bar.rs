@@ -384,7 +384,7 @@ impl Render for PlayerBar {
                             .child(format_time(dur)),
                     ),
             )
-            .child(icon(IconName::Volume2).size(rems(0.875)))
+            .child(icon(IconName::Volume2).size(rems(0.875)).text_color(theme.foreground))
             .child(
                 div()
                     .w(rems(6.))
